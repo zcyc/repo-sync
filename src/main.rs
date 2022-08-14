@@ -9,7 +9,7 @@ struct Args {
         short,
         long,
         value_parser,
-        help = "source repo url, like: https://github.com/zcyc/repo-sync.git"
+        help = "source repo, eg: https://github.com/zcyc/repo-sync.git"
     )]
     src: String,
 
@@ -17,9 +17,10 @@ struct Args {
         short,
         long,
         value_parser,
-        help = "target repo url, like: https://github.com/zcyc/repo-sync.git"
+        multiple_values = true,
+        help = "target repo, eg: https://github.com/zcyc/repo-sync.git"
     )]
-    target: String,
+    target: Vec<String>,
 }
 
 fn main() {
@@ -39,33 +40,37 @@ fn main() {
         .expect("failed to execute pull process");
     println!("{:?}", pull_output);
     // 3.git remote add
-    let remote_add_output = Command::new("sh")
-        .args(["-c", &git_remote_add_cmd(args.target.clone())])
-        .output()
-        .expect("failed to execute remote add process");
-    println!("{:?}", remote_add_output);
+    args.target.iter().enumerate().for_each(|(i, x)| {
+        let remote_add_output = Command::new("sh")
+            .args(["-c", &git_remote_add_cmd(i, x.to_string())])
+            .output()
+            .expect("failed to execute remote add process");
+        println!("{:?}", remote_add_output);
+    });
     // 4.git push
-    let push_output = Command::new("sh")
-        .args(["-c", &git_push_cmd()])
-        .output()
-        .expect("failed to execute push process");
-    println!("{:?}", push_output);
+    args.target.iter().enumerate().for_each(|(i, _x)| {
+        let push_output = Command::new("sh")
+            .args(["-c", &git_push_cmd(i)])
+            .output()
+            .expect("failed to execute push process");
+        println!("{:?}", push_output);
+    });
 }
 
 fn git_clone_cmd(repo_url: String) -> String {
     format!("git clone {}", repo_url)
 }
 
-fn git_remote_add_cmd(repo_url: String) -> String {
-    format!("git remote add target {}", repo_url)
+fn git_remote_add_cmd(index: usize, repo_url: String) -> String {
+    format!("git remote add target{} {}", index, repo_url)
 }
 
 fn git_pull_cmd() -> String {
     "git pull".to_string()
 }
 
-fn git_push_cmd() -> String {
-    "git push target".to_string()
+fn git_push_cmd(index: usize) -> String {
+    format!("git push target{}", index)
 }
 
 fn current_dir(repo_url: String) -> String {
