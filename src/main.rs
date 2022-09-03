@@ -60,11 +60,13 @@ fn main() {
         panic!("source, target, file 参数不能同时为空!");
     };
 
-    // start scheduler
+    // run one time
     if config.crontab.is_empty() {
         job(config);
         return;
     }
+
+    // start crontab scheduler
     let mut sched = JobScheduler::new();
     sched.add(Job::new(config.crontab.parse().unwrap(), || {
         job(config.clone())
