@@ -12,7 +12,7 @@ struct Args {
         help = "source repo, eg: https://github.com/zcyc/repo-sync.git",
         required = false
     )]
-    source: String,
+    source: Option<String>,
 
     #[clap(
         short,
@@ -22,7 +22,7 @@ struct Args {
         help = "target repo, eg: https://github.com/zcyc/repo-sync.git",
         required = false
     )]
-    target: Vec<String>,
+    target: Option<Vec<String>>,
 
     #[clap(
         short,
@@ -31,28 +31,26 @@ struct Args {
         help = "config file path, eg: ./config.json",
         required = false
     )]
-    file: String,
+    file: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
 
-    if args.file.is_empty() && (args.source.is_empty() || args.target.is_empty()) {
-        return;
-    }
-
-    // config set to command line flag in default
-    let mut config = Config {
-        source: args.source,
-        target: args.target,
+    let config = if args.source.is_some() && args.target.is_some() {
+        Config {
+            source: args.source.unwrap(),
+            target: args.target.unwrap(),
+        }
+    } else if args.file.is_some() {
+        let file = get_config(args.file.unwrap());
+        Config {
+            source: file.source,
+            target: file.target,
+        }
+    } else {
+        panic!("source, target, file 参数不能同时为空!");
     };
-
-    // if use config file, cover command line params
-    if !args.file.is_empty() {
-        let file = get_config(args.file);
-        config.source = file.source;
-        config.target = file.target;
-    }
 
     // 1.git clone
     let clone_output = Command::new("sh")
