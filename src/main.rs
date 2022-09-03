@@ -43,7 +43,7 @@ struct Args {
 fn main() {
     // load config
     let _args = Args::parse();
-    let _config = Config { jobs: todo!() };
+    let mut _config = Config { jobs: Vec::new() };
     if _args.source.is_some() && _args.target.is_some() {
         _config.jobs.push(Item {
             source: _args.source.unwrap(),
@@ -67,9 +67,9 @@ fn main() {
             return;
         }
         // add to cron jobs
-        let crontab_str = config_item.crontab.unwrap();
+        let crontab_str = config_item.clone().crontab.unwrap();
         println!("crontab_str {:#?}", crontab_str);
-        sched.add(Job::new(crontab_str.parse().unwrap(), || {
+        sched.add(Job::new(crontab_str.parse().unwrap(), move || {
             sync(config_item.clone())
         }));
     }
