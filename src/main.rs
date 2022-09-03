@@ -42,38 +42,39 @@ struct Args {
 
 fn main() {
     // load config
-    let args = Args::parse();
-    let config = if args.source.is_some() && args.target.is_some() {
-        Config {
-            source: args.source.unwrap(),
-            target: args.target.unwrap(),
-            crontab: args.crontab,
-        }
-    } else if args.file.is_some() {
-        let file = get_config(args.file.unwrap());
-        Config {
-            source: file.source,
-            target: file.target,
-            crontab: file.crontab,
-        }
+    let _args = Args::parse();
+    let _config = Config { jobs: todo!() };
+    if _args.source.is_some() && _args.target.is_some() {
+        _config.jobs.push(Item {
+            source: _args.source.unwrap(),
+            target: _args.target.unwrap(),
+            crontab: _args.crontab,
+        })
+    } else if _args.file.is_some() {
+        let file = get_config(_args.file.unwrap());
+        _config.jobs = file.jobs;
     } else {
         panic!("source, target, file 参数不能同时为空!");
     };
-    println!("config {:#?}", config);
+    println!("config {:#?}", _config);
 
-    // run one time
-    if config.crontab.is_none() {
-        job(config);
-        return;
+    // create cron schedule
+    let mut sched = JobScheduler::new();
+    for config_item in _config.jobs {
+        // run one time
+        if config_item.crontab.is_none() {
+            sync(config_item);
+            return;
+        }
+        // add to cron jobs
+        let crontab_str = config_item.crontab.unwrap();
+        println!("crontab_str {:#?}", crontab_str);
+        sched.add(Job::new(crontab_str.parse().unwrap(), || {
+            sync(config_item.clone())
+        }));
     }
-    let crontab_str = config.crontab.clone().unwrap();
-    println!("crontab_str {:#?}", crontab_str);
 
     // start crontab scheduler
-    let mut sched = JobScheduler::new();
-    sched.add(Job::new(crontab_str.parse().unwrap(), || {
-        job(config.clone())
-    }));
     loop {
         sched.tick();
         std::thread::sleep(Duration::from_millis(500));
@@ -81,7 +82,7 @@ fn main() {
 }
 
 // core logic
-fn job(config: Config) {
+fn sync(config: Item) {
     // 1.git clone
     let clone_output = Command::new("sh")
         .args(["-c", &git_clone_cmd(config.source.clone())])
@@ -146,8 +147,13 @@ pub fn get_config(path: String) -> Config {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Config {
+pub struct Item {
     pub source: String,
     pub target: Vec<String>,
     pub crontab: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Config {
+    pub jobs: Vec<Item>,
 }
