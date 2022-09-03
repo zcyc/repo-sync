@@ -47,7 +47,7 @@ fn main() {
         Config {
             source: args.source.unwrap(),
             target: args.target.unwrap(),
-            crontab: args.crontab.unwrap(),
+            crontab: args.crontab,
         }
     } else if args.file.is_some() {
         let file = get_config(args.file.unwrap());
@@ -59,16 +59,19 @@ fn main() {
     } else {
         panic!("source, target, file 参数不能同时为空!");
     };
+    println!("config {:#?}", config);
 
     // run one time
-    if config.crontab.is_empty() {
+    if config.crontab.is_none() {
         job(config);
         return;
     }
+    let crontab_str = config.crontab.clone().unwrap();
+    println!("crontab_str {:#?}", crontab_str);
 
     // start crontab scheduler
     let mut sched = JobScheduler::new();
-    sched.add(Job::new(config.crontab.parse().unwrap(), || {
+    sched.add(Job::new(crontab_str.parse().unwrap(), || {
         job(config.clone())
     }));
     loop {
@@ -146,5 +149,5 @@ pub fn get_config(path: String) -> Config {
 pub struct Config {
     pub source: String,
     pub target: Vec<String>,
-    pub crontab: String,
+    pub crontab: Option<String>,
 }
