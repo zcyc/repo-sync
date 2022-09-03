@@ -1,6 +1,7 @@
 use clap::Parser;
+use job_scheduler_ng::{Job, JobScheduler};
 use serde::{Deserialize, Serialize};
-use std::{env, fs::File, io::BufReader, process::Command};
+use std::{env, fs::File, io::BufReader, process::Command, time::Duration};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -29,26 +30,53 @@ struct Args {
         help = "config file path, eg: ./config.json"
     )]
     file: Option<String>,
+
+    #[clap(
+        short,
+        long,
+        value_parser,
+        help = "crontab string, eg: '0 * * * * ? *'"
+    )]
+    crontab: Option<String>,
 }
 
 fn main() {
+    // load config
     let args = Args::parse();
-
     let config = if args.source.is_some() && args.target.is_some() {
         Config {
             source: args.source.unwrap(),
             target: args.target.unwrap(),
+            crontab: args.crontab.unwrap(),
         }
     } else if args.file.is_some() {
         let file = get_config(args.file.unwrap());
         Config {
             source: file.source,
             target: file.target,
+            crontab: file.crontab,
         }
     } else {
         panic!("source, target, file 参数不能同时为空!");
     };
 
+    // start scheduler
+    if config.crontab.is_empty() {
+        job(config);
+        return;
+    }
+    let mut sched = JobScheduler::new();
+    sched.add(Job::new(config.crontab.parse().unwrap(), || {
+        job(config.clone())
+    }));
+    loop {
+        sched.tick();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// core logic
+fn job(config: Config) {
     // 1.git clone
     let clone_output = Command::new("sh")
         .args(["-c", &git_clone_cmd(config.source.clone())])
@@ -116,4 +144,5 @@ pub fn get_config(path: String) -> Config {
 pub struct Config {
     pub source: String,
     pub target: Vec<String>,
+    pub crontab: String,
 }

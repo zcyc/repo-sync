@@ -3,5 +3,6 @@
     "target": [
         "https://github.com/zcyc/repo-sync-1.git",
         "https://github.com/zcyc/repo-sync-2.git"
-    ]
+    ],
+    "crontab": "0 * * * * ? *"
 }
