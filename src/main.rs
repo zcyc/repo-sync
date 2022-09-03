@@ -59,7 +59,7 @@ fn main() {
     println!("config {:#?}", config);
 
     // create cron schedule
-    let mut sched = JobScheduler::new();
+    let mut schedule = JobScheduler::new();
     for config_item in config.jobs {
         // run one time
         if config_item.crontab.is_none() {
@@ -69,14 +69,14 @@ fn main() {
         // add to cron jobs
         let crontab_str = config_item.clone().crontab.unwrap();
         println!("crontab_str {:#?}", crontab_str);
-        sched.add(Job::new(crontab_str.parse().unwrap(), move || {
+        schedule.add(Job::new(crontab_str.parse().unwrap(), move || {
             sync(config_item.clone())
         }));
     }
 
     // start crontab scheduler
     loop {
-        sched.tick();
+        schedule.tick();
         std::thread::sleep(Duration::from_millis(500));
     }
 }
