@@ -9,8 +9,7 @@ struct Args {
         short,
         long,
         value_parser,
-        help = "source repo, eg: https://github.com/zcyc/repo-sync.git",
-        required = false
+        help = "source repo, eg: https://github.com/zcyc/repo-sync.git"
     )]
     source: Option<String>,
 
@@ -19,8 +18,7 @@ struct Args {
         long,
         value_parser,
         multiple_values = true,
-        help = "target repo, eg: https://github.com/zcyc/repo-sync.git",
-        required = false
+        help = "target repo, eg: https://github.com/zcyc/repo-sync.git"
     )]
     target: Option<Vec<String>>,
 
@@ -28,8 +26,7 @@ struct Args {
         short,
         long,
         value_parser,
-        help = "config file path, eg: ./config.json",
-        required = false
+        help = "config file path, eg: ./config.json"
     )]
     file: Option<String>,
 }
