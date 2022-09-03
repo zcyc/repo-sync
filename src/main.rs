@@ -42,25 +42,25 @@ struct Args {
 
 fn main() {
     // load config
-    let _args = Args::parse();
-    let mut _config = Config { jobs: Vec::new() };
-    if _args.source.is_some() && _args.target.is_some() {
-        _config.jobs.push(Item {
-            source: _args.source.unwrap(),
-            target: _args.target.unwrap(),
-            crontab: _args.crontab,
+    let args = Args::parse();
+    let mut config = Config { jobs: Vec::new() };
+    if args.source.is_some() && args.target.is_some() {
+        config.jobs.push(Item {
+            source: args.source.unwrap(),
+            target: args.target.unwrap(),
+            crontab: args.crontab,
         })
-    } else if _args.file.is_some() {
-        let file = get_config(_args.file.unwrap());
-        _config.jobs = file.jobs;
+    } else if args.file.is_some() {
+        let file = get_config(args.file.unwrap());
+        config.jobs = file.jobs;
     } else {
         panic!("source, target, file 参数不能同时为空!");
     };
-    println!("config {:#?}", _config);
+    println!("config {:#?}", config);
 
     // create cron schedule
     let mut sched = JobScheduler::new();
-    for config_item in _config.jobs {
+    for config_item in config.jobs {
         // run one time
         if config_item.crontab.is_none() {
             sync(config_item);
