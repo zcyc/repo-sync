@@ -52,7 +52,7 @@ fn main() {
     } else if args.file.is_some() {
         get_config_vec(args.file.unwrap())
     } else {
-        panic!("source, target, file 参数不能同时为空!");
+        panic!("command line flags cannot be empty at the same time!");
     };
     println!("config {:#?}", config_vec);
 
