@@ -65,7 +65,7 @@ fn main() {
             return;
         }
         // add to cron jobs
-        let crontab_str = config_item.clone().crontab.unwrap();
+        let crontab_str = config_item.crontab.clone().unwrap();
         println!("crontab_str {:#?}", crontab_str);
         schedule.add(Job::new(crontab_str.parse().unwrap(), move || {
             sync(&config_item)
