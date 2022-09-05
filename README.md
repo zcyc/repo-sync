@@ -1,6 +1,8 @@
 # repo-sync
 a repo sync tool alternative to gitlab mirroring repositories
 
+![reposync logo](/images/logo.png)
+
 ```
 USAGE:
     repo-sync [OPTIONS]
