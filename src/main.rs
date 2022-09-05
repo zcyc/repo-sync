@@ -1,6 +1,6 @@
 use clap::Parser;
 use job_scheduler_ng::{Job, JobScheduler};
-use repo_sync::{get_config, sync, Config, Item};
+use repo_sync::{get_config_vec, sync, Item};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -43,24 +43,22 @@ struct Args {
 fn main() {
     // load config
     let args = Args::parse();
-    let mut config = Config { jobs: Vec::new() };
-    if args.source.is_some() && args.target.is_some() {
-        config.jobs.push(Item {
+    let config_vec = if args.source.is_some() && args.target.is_some() {
+        vec![Item {
             source: args.source.unwrap(),
             target: args.target.unwrap(),
             crontab: args.crontab,
-        })
+        }]
     } else if args.file.is_some() {
-        let file = get_config(args.file.unwrap());
-        config.jobs = file.jobs;
+        get_config_vec(args.file.unwrap())
     } else {
         panic!("source, target, file 参数不能同时为空!");
     };
-    println!("config {:#?}", config);
+    println!("config {:#?}", config_vec);
 
     // create cron schedule
     let mut schedule = JobScheduler::new();
-    for config_item in config.jobs {
+    for config_item in config_vec {
         // run one time
         if config_item.crontab.is_none() {
             sync(config_item);

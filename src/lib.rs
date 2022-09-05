@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{env, fs::File, io::BufReader, process::Command};
 
-// load config
-pub fn get_config(path: String) -> Config {
+// load config vec
+pub fn get_config_vec(path: String) -> Vec<Item> {
     let file = File::open(path).unwrap();
     let reader = BufReader::new(file);
     serde_json::from_reader(reader).unwrap()
@@ -13,11 +13,6 @@ pub struct Item {
     pub source: String,
     pub target: Vec<String>,
     pub crontab: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Config {
-    pub jobs: Vec<Item>,
 }
 
 // core logic
