@@ -50,7 +50,7 @@ fn main() {
             crontab: args.crontab,
         }]
     } else if args.file.is_some() {
-        get_config_vec(args.file.unwrap())
+        get_config_vec(&args.file.unwrap())
     } else {
         panic!("command line flags cannot be empty at the same time!");
     };
