@@ -61,14 +61,14 @@ fn main() {
     for config_item in config_vec {
         // run one time
         if config_item.crontab.is_none() {
-            sync(config_item);
+            sync(&config_item);
             return;
         }
         // add to cron jobs
         let crontab_str = config_item.clone().crontab.unwrap();
         println!("crontab_str {:#?}", crontab_str);
         schedule.add(Job::new(crontab_str.parse().unwrap(), move || {
-            sync(config_item.clone())
+            sync(&config_item)
         }));
     }
 

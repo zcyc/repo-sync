@@ -16,7 +16,7 @@ pub struct Item {
 }
 
 // core logic
-pub fn sync(config: Item) {
+pub fn sync(config: &Item) {
     // 1.git clone
     let clone_output = Command::new("sh")
         .args(["-c", &git_clone_cmd(config.source.clone())])
