@@ -1,5 +1,7 @@
 # repo-sync
-a repo sync tool alternative to gitlab mirroring repositories
+This is a repositories synchronize tool alternative to gitlab mirroring repositories.
+
+[NOTE] Before you begin the task, make sure that you can access and operate your source and target repositories.
 
 ![reposync logo](/images/logo.png)
 
