@@ -18,7 +18,6 @@ struct Args {
         short,
         long,
         value_parser,
-        multiple_values = true,
         help = "target repo, eg: https://github.com/zcyc/repo-sync.git"
     )]
     target: Option<Vec<String>>,
