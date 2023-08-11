@@ -1,5 +1,5 @@
 # repo-sync
-repositories synchronization tool
+A lightweight synchronization tool for git repositories.
 
 # Notice
 Before you begin the task, make sure that you can access and operate your source and target repositories.
