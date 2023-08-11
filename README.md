@@ -1,7 +1,8 @@
 # repo-sync
-This is a repositories synchronize tool alternative to gitlab mirroring repositories.
+repositories synchronization tool
 
-[NOTE] Before you begin the task, make sure that you can access and operate your source and target repositories.
+# Notice
+Before you begin the task, make sure that you can access and operate your source and target repositories.
 
 ![reposync logo](/images/logo.png)
 
@@ -17,3 +18,7 @@ OPTIONS:
     -t, --target <TARGET>...    target repo, eg: https://github.com/zcyc/repo-sync.git
     -V, --version               Print version information
 ```
+
+# Why Not
+- [git-sync](https://github.com/kubernetes/git-sync) of `kubernetes` only synchronizes the repository into the folder.
+- [Repository mirroring](https://docs.gitlab.com/ee/user/project/repository/mirror/) of `GitLab` requires a paid version.
