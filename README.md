@@ -1,7 +1,7 @@
+![reposync logo](/images/logo.png)
+
 # repo-sync
 A lightweight synchronization tool for git repositories.
-
-![reposync logo](/images/logo.png)
 
 # Manual
 ```
