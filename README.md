@@ -3,7 +3,7 @@
 # repo-sync
 A lightweight synchronization tool for git repositories.
 
-# Manual
+## Manual
 ```
 USAGE:
     repo-sync [OPTIONS]
@@ -17,9 +17,9 @@ OPTIONS:
     -V, --version               Print version information
 ```
 
-# Notice
+## Notice
 Before you begin the task, make sure that you can access and operate your source and target repositories.
 
-# Why Not
+## Why Not
 - [git-sync](https://github.com/kubernetes/git-sync) of `kubernetes` only synchronizes the repository into the folder.
 - [Repository mirroring](https://docs.gitlab.com/ee/user/project/repository/mirror/) of `GitLab` requires a paid version.
