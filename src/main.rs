@@ -37,6 +37,14 @@ struct Args {
         help = "crontab string, eg: '0 * * * * ? *'"
     )]
     crontab: Option<String>,
+
+    #[clap(
+        short = 'b',
+        long,
+        value_parser,
+        help = "specific branch to sync, eg: 'main'"
+    )]
+    branch: Option<String>,
 }
 
 fn main() {
@@ -47,6 +55,7 @@ fn main() {
             source: args.source.unwrap(),
             target: args.target.unwrap(),
             crontab: args.crontab,
+            branch: args.branch,
         }]
     } else if args.file.is_some() {
         get_config_vec(&args.file.unwrap())
