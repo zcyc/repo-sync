@@ -1,8 +1,9 @@
 use clap::Parser;
 use job_scheduler_ng::{Job, JobScheduler, Schedule};
 use repo_sync::{
-    check, cooldown_active, load, retry_event as retry_webhook, serve_webhook, status_report, sync,
-    validate, webhook_events, DivergencePolicy, Item, SyncMode, TagPolicy,
+    check, check_task_database, cooldown_active, list_tasks, retry_event as retry_webhook,
+    serve_webhook, status_report, sync, validate, webhook_events, DivergencePolicy, Item, SyncMode,
+    TagPolicy,
 };
 use std::{
     error::Error,
@@ -23,12 +24,17 @@ struct Args {
     #[clap(short, long, num_args = 1.., help = "target repository URLs or paths")]
     target: Option<Vec<String>>,
 
-    #[clap(short, long, help = "TOML config file path")]
-    file: Option<String>,
+    #[clap(
+        short = 'd',
+        long,
+        default_value = "repo-sync-tasks.sqlite3",
+        help = "SQLite task database path"
+    )]
+    database: String,
 
     #[clap(
         long,
-        help = "local repository workspace; selects --retry-event when used with --file"
+        help = "local repository workspace; selects --retry-event from the task database"
     )]
     workspace: Option<String>,
 
@@ -98,11 +104,11 @@ struct Args {
     #[clap(long, help = "format --status as JSON")]
     json: bool,
 
-    #[clap(long, help = "listen for GitHub/GitLab webhook POST triggers")]
+    #[clap(
+        long,
+        help = "listen for Webhook POST triggers and serve the embedded page"
+    )]
     serve: Option<String>,
-
-    #[clap(long, help = "GitHub webhook secret or GitLab signing/secret token")]
-    webhook_secret: Option<String>,
 
     #[clap(long, help = "maximum pending webhook events per sync item")]
     webhook_max_pending_events: Option<u64>,
@@ -138,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let Args {
         source,
         target,
-        file,
+        database,
         workspace,
         mode,
         crontab,
@@ -163,7 +169,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         status: status_only,
         json,
         serve: serve_addr,
-        webhook_secret,
         webhook_max_pending_events,
         webhook_event_lease_secs,
         events,
@@ -173,7 +178,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         once,
     } = Args::parse();
     let retry_workspace = workspace.clone();
-    let config_file = file.clone();
+    let database_path = Path::new(&database);
+    let direct_mode = source.is_some() || target.is_some();
+    let control_command = check_only
+        || status_only
+        || events
+        || retry_event.is_some()
+        || prune_history_days.is_some()
+        || backup_state.is_some();
 
     if check_only && once {
         return Err("--check and --once cannot be used together".into());
@@ -223,20 +235,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("--backup-state cannot be combined with another control command".into());
     }
-    if serve_addr.is_some() && config_file.is_none() && webhook_secret.is_none() {
-        return Err("direct --serve requires --webhook-secret".into());
-    }
-    if serve_addr.is_some() && config_file.is_some() && webhook_secret.is_some() {
+    if serve_addr.is_some() && direct_mode {
         return Err(
-            "--webhook-secret cannot be used with --file; configure webhook_secret_envs".into(),
+            "--serve uses tasks from --database; direct sync options are not supported".into(),
         );
     }
-    if serve_addr.is_none() && webhook_secret.is_some() {
-        return Err("--webhook-secret requires --serve".into());
-    }
 
-    let config = match (source, target, file) {
-        (Some(source), Some(target), None) => {
+    let config = match (source, target) {
+        (Some(source), Some(target)) => {
             if branches.is_some() && all_branches {
                 return Err("use either --branches or --all-branches".into());
             }
@@ -279,7 +285,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .ok_or("--webhook-event-lease-secs is required")?,
             }]
         }
-        (None, None, Some(file))
+        (None, None)
             if (workspace.is_none() || retry_event.is_some())
                 && mode.is_none()
                 && crontab.is_none()
@@ -302,12 +308,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && webhook_max_pending_events.is_none()
                 && webhook_event_lease_secs.is_none() =>
         {
-            load(&file)?
+            list_tasks(database_path)?
+                .into_iter()
+                .filter(|task| control_command || task.enabled)
+                .map(|task| task.item)
+                .collect()
         }
-        _ => return Err("use either --file or all direct sync options".into()),
+        _ => return Err("use either --database or all direct sync options".into()),
     };
 
-    validate(&config)?;
+    if !config.is_empty() {
+        validate(&config)?;
+    }
     for item in &config {
         if let Some(crontab) = item.crontab.as_deref() {
             crontab.parse::<Schedule>()?;
@@ -315,6 +327,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if check_only {
+        check_task_database(database_path)?;
         for item in &config {
             repo_sync::check_state(Path::new(&item.workspace), &item.source)?;
             check(item, check_write)?;
@@ -423,12 +436,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_once(config);
     }
     if let Some(addr) = serve_addr {
-        return serve_webhook(
-            &addr,
-            config,
-            config_file.as_deref(),
-            webhook_secret.as_deref(),
-        );
+        return serve_webhook(&addr, database_path);
     }
 
     let mut schedule = JobScheduler::new();

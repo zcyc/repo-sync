@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>repo-sync</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #172033; background: #f4f6fa; }
+    body { max-width: 1280px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+    header, section { background: #fff; border: 1px solid #dfe4ec; border-radius: 12px; padding: 1rem; margin-block: 1rem; box-shadow: 0 2px 10px #1720330b; }
+    header { display: flex; gap: 1rem; align-items: end; justify-content: space-between; flex-wrap: wrap; }
+    h1, h2 { margin: 0 0 .75rem; }
+    h1 { font-size: 1.6rem; }
+    h2 { font-size: 1.1rem; }
+    .controls, .actions { display: flex; gap: .5rem; align-items: end; flex-wrap: wrap; }
+    label { display: grid; gap: .25rem; font-size: .85rem; }
+    input, textarea, select, button { font: inherit; border: 1px solid #b9c2d1; border-radius: 8px; padding: .55rem .7rem; }
+    input[type="checkbox"] { width: 1rem; height: 1rem; }
+    input[type="number"] { width: 8rem; }
+    input, textarea, select { width: 100%; box-sizing: border-box; }
+    input#username, input#password, input#password-confirm { min-width: 16rem; width: auto; }
+    textarea { min-height: 5rem; resize: vertical; }
+    button { cursor: pointer; background: #1d5fd1; border-color: #1d5fd1; color: #fff; }
+    button.secondary { background: #fff; color: #172033; }
+    button.danger { background: #ae2535; border-color: #ae2535; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    :focus-visible { outline: 3px solid #77a7ff; outline-offset: 2px; }
+    #message { min-height: 1.4rem; margin: 0; }
+    .error { color: #ae2535; }
+    .muted { color: #5c687b; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; min-width: 940px; }
+    th, td { text-align: left; border-bottom: 1px solid #e7eaf0; padding: .7rem .5rem; vertical-align: top; }
+    th { color: #5c687b; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+    code, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .pill { display: inline-block; border-radius: 999px; padding: .15rem .5rem; background: #e7eefc; color: #214b96; font-size: .85rem; }
+    .pill.off { background: #eceef2; color: #5c687b; }
+    .form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; }
+    .wide { grid-column: span 2; }
+    .full { grid-column: 1 / -1; }
+    .checks { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    .checks label { display: flex; align-items: center; gap: .35rem; }
+    details { margin-top: 1rem; }
+    summary { cursor: pointer; font-weight: 600; margin-bottom: 1rem; }
+    @media (max-width: 800px) { .form-grid { grid-template-columns: 1fr; } .wide, .full { grid-column: auto; } }
+    @media (prefers-color-scheme: dark) {
+      :root { color: #e7edf8; background: #101827; }
+      header, section { background: #172235; border-color: #30405b; }
+      input, textarea, select, button.secondary { background: #172235; color: #e7edf8; border-color: #536581; }
+      textarea { background: #101827; }
+      th, td { border-color: #30405b; }
+      .muted { color: #a9b6ca; }
+      .pill.off { background: #30405b; color: #a9b6ca; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>repo-sync</h1>
+      <p class="muted">SQLite 任务、同步状态和 Webhook 队列</p>
+    </div>
+    <div class="controls">
+      <button id="refresh" class="secondary" type="button">刷新</button>
+      <button id="logout" class="secondary" type="button" hidden>退出登录</button>
+    </div>
+  </header>
+
+  <p id="message" role="status" aria-live="polite"></p>
+
+  <section id="auth-panel">
+    <h2 id="auth-title">登录</h2>
+    <form id="auth-form" class="form-grid">
+      <label for="username">账号
+        <input id="username" name="username" required maxlength="64" autocomplete="username">
+      </label>
+      <label for="password">密码
+        <input id="password" name="password" type="password" required minlength="12" maxlength="256" autocomplete="current-password">
+      </label>
+      <label id="password-confirm-field" for="password-confirm">确认密码
+        <input id="password-confirm" name="password-confirm" type="password" minlength="12" maxlength="256" autocomplete="new-password">
+      </label>
+      <p class="actions full"><button id="auth-submit" type="submit">登录</button></p>
+    </form>
+  </section>
+
+  <main id="app" hidden>
+  <section>
+    <div class="actions">
+      <h2 style="margin-right:auto">同步任务</h2>
+      <button id="new-task" type="button">新建任务</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID / 状态</th><th>Workspace</th><th>源仓库</th><th>模式 / 调度</th><th>最近运行</th><th>目标</th><th>Webhook 队列</th><th>操作</th></tr></thead>
+        <tbody id="tasks"><tr><td colspan="8" class="muted">登录后加载任务</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="editor-title">新建同步任务</h2>
+    <form id="task-form">
+      <input id="task-id" type="hidden">
+      <div class="form-grid">
+        <label class="wide">源仓库 URL 或路径
+          <input id="source" required placeholder="https://example.com/org/repo.git">
+        </label>
+        <label>Workspace
+          <input id="workspace" required placeholder="./repo-workspace">
+        </label>
+        <label class="wide">目标仓库（每行一个）
+          <textarea id="target" required placeholder="https://example.com/org/mirror.git"></textarea>
+        </label>
+        <label>模式
+          <select id="mode"><option value="branch">branch</option><option value="mirror">mirror</option></select>
+        </label>
+        <label>Crontab（可选）
+          <input id="crontab" placeholder="0/10 * * * * ? *">
+        </label>
+        <label>分支（每行一个，空=全部）
+          <textarea id="branches" placeholder="main&#10;release/*"></textarea>
+        </label>
+        <label>包含 refs（每行一个）
+          <textarea id="include-refs" placeholder="refs/heads/*"></textarea>
+        </label>
+        <label>排除 refs（每行一个）
+          <textarea id="exclude-refs" placeholder="refs/heads/tmp/*"></textarea>
+        </label>
+        <label>超时（秒）
+          <input id="timeout-secs" type="number" min="1" value="300" required>
+        </label>
+      </div>
+      <details>
+        <summary>高级选项</summary>
+        <div class="form-grid">
+          <div class="full checks">
+            <label><input id="enabled" type="checkbox" checked>启用任务</label>
+            <label><input id="dry-run" type="checkbox">Dry run</label>
+            <label><input id="allow-destructive" type="checkbox">允许破坏性操作</label>
+            <label><input id="sync-lfs" type="checkbox">同步 Git LFS</label>
+            <label><input id="prune-branches" type="checkbox">清理目标分支</label>
+            <label><input id="prune-tags" type="checkbox">清理目标标签</label>
+            <label><input id="atomic" type="checkbox" checked>Atomic push</label>
+          </div>
+          <label>分支分叉策略
+            <select id="divergence"><option value="fail">fail</option><option value="keep">keep</option><option value="force">force</option></select>
+          </label>
+          <label>标签冲突策略
+            <select id="tag-policy"><option value="preserve">preserve</option><option value="fail">fail</option><option value="force">force</option></select>
+          </label>
+          <label>额外重试次数
+            <input id="max-retries" type="number" min="0" max="10" value="3" required>
+          </label>
+          <label>重试初始间隔（秒）
+            <input id="retry-backoff-secs" type="number" min="0" value="5" required>
+          </label>
+          <label>失败冷却（秒）
+            <input id="failure-cooldown-secs" type="number" min="0" value="60" required>
+          </label>
+          <label>Webhook secret 环境变量（每行一个）
+            <textarea id="webhook-secret-envs" placeholder="REPO_SYNC_WEBHOOK_SECRET_MAIN"></textarea>
+          </label>
+          <label>最大待处理事件数
+            <input id="webhook-max-pending-events" type="number" min="1" value="10000" required>
+          </label>
+          <label>事件租约（秒）
+            <input id="webhook-event-lease-secs" type="number" min="1" value="900" required>
+          </label>
+        </div>
+      </details>
+      <p class="actions"><button type="submit">保存任务</button><button id="cancel" class="secondary" type="button">取消编辑</button></p>
+    </form>
+  </section>
+  </main>
+
+  <script>
+    const message = document.querySelector('#message');
+    const authPanel = document.querySelector('#auth-panel');
+    const authTitle = document.querySelector('#auth-title');
+    const authForm = document.querySelector('#auth-form');
+    const authSubmit = document.querySelector('#auth-submit');
+    const passwordConfirmField = document.querySelector('#password-confirm-field');
+    const logout = document.querySelector('#logout');
+    const app = document.querySelector('#app');
+    const tasks = document.querySelector('#tasks');
+    const form = document.querySelector('#task-form');
+    const editorTitle = document.querySelector('#editor-title');
+    const refresh = document.querySelector('#refresh');
+    let taskRecords = [];
+    let snapshot = [];
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const request = async (url, options = {}) => {
+      const response = await fetch(url, { credentials: 'same-origin', ...options, headers: { ...(options.headers || {}) } });
+      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+      return response.status === 204 ? null : response.json();
+    };
+    const lines = id => document.querySelector(`#${id}`).value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    const setLines = (id, values) => { document.querySelector(`#${id}`).value = (values || []).join('\n'); };
+    const number = id => Number(document.querySelector(`#${id}`).value);
+    const checked = id => document.querySelector(`#${id}`).checked;
+
+    function showAuth(initialized) {
+      authPanel.hidden = false; app.hidden = true; logout.hidden = true;
+      authTitle.textContent = initialized ? '登录' : '首次设置管理员账号';
+      authSubmit.textContent = initialized ? '登录' : '设置并登录';
+      passwordConfirmField.hidden = initialized;
+      document.querySelector('#password').autocomplete = initialized ? 'current-password' : 'new-password';
+    }
+
+    function showApp() { authPanel.hidden = true; app.hidden = false; logout.hidden = false; }
+
+    async function initAuth() {
+      try {
+        const response = await fetch('/api/auth/status', { credentials: 'same-origin' });
+        const status = await response.json();
+        showAuth(status.initialized);
+        if (status.initialized) await load();
+      } catch (error) { message.textContent = `认证状态读取失败：${error.message}`; message.className = 'error'; }
+    }
+
+    const emptyItem = () => ({
+      source: '', target: [], workspace: './workspace', mode: 'branch', crontab: null,
+      branches: [], include_refs: [], exclude_refs: [], timeout_secs: 300, dry_run: false,
+      allow_destructive: false, sync_lfs: false, divergence: 'fail', tag_policy: 'preserve',
+      prune_branches: false, prune_tags: false, atomic: true, max_retries: 3,
+      retry_backoff_secs: 5, failure_cooldown_secs: 60, webhook_secret_envs: [],
+      webhook_max_pending_events: 10000, webhook_event_lease_secs: 900
+    });
+
+    async function load() {
+      message.textContent = '加载中…'; message.className = 'muted';
+      try {
+        const [nextSnapshot, nextTasks] = await Promise.all([request('/api/status'), request('/api/tasks')]);
+        snapshot = nextSnapshot.items || [];
+        taskRecords = nextTasks || [];
+        render();
+        message.textContent = `最后更新：${new Date().toLocaleString()}`;
+        showApp();
+      } catch (error) {
+        if (error.message.startsWith('401')) { showAuth(true); message.textContent = '登录已失效，请重新登录'; message.className = 'error'; }
+        else { message.textContent = `加载失败：${error.message}`; message.className = 'error'; }
+      }
+    }
+
+    function render() {
+      tasks.innerHTML = snapshot.length ? snapshot.map(item => {
+        const config = item.config;
+        const run = item.status.latest_run;
+        const queue = Object.entries(item.queue.counts || {}).map(([key, value]) => `${escapeHtml(key)}=${value}`).join(' · ') || '空';
+        const event = item.events[0];
+        const state = item.enabled ? '<span class="pill">启用</span>' : '<span class="pill off">停用</span>';
+        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${escapeHtml(run?.status || 'none')}<br><span class="muted">${run?.error ? escapeHtml(run.error) : ''}</span></td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td class="actions"><button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
+      }).join('') : '<tr><td colspan="8" class="muted">没有任务，点击“新建任务”开始</td></tr>';
+    }
+
+    function setForm(task) {
+      const item = task?.item || emptyItem();
+      document.querySelector('#task-id').value = task?.id || '';
+      document.querySelector('#source').value = item.source;
+      setLines('target', item.target); document.querySelector('#workspace').value = item.workspace;
+      document.querySelector('#mode').value = item.mode; document.querySelector('#crontab').value = item.crontab || '';
+      setLines('branches', item.branches); setLines('include-refs', item.include_refs); setLines('exclude-refs', item.exclude_refs);
+      document.querySelector('#timeout-secs').value = item.timeout_secs;
+      document.querySelector('#enabled').checked = task ? task.enabled : true;
+      document.querySelector('#dry-run').checked = item.dry_run; document.querySelector('#allow-destructive').checked = item.allow_destructive;
+      document.querySelector('#sync-lfs').checked = item.sync_lfs; document.querySelector('#prune-branches').checked = item.prune_branches;
+      document.querySelector('#prune-tags').checked = item.prune_tags; document.querySelector('#atomic').checked = item.atomic;
+      document.querySelector('#divergence').value = item.divergence; document.querySelector('#tag-policy').value = item.tag_policy;
+      document.querySelector('#max-retries').value = item.max_retries; document.querySelector('#retry-backoff-secs').value = item.retry_backoff_secs;
+      document.querySelector('#failure-cooldown-secs').value = item.failure_cooldown_secs; setLines('webhook-secret-envs', item.webhook_secret_envs);
+      document.querySelector('#webhook-max-pending-events').value = item.webhook_max_pending_events;
+      document.querySelector('#webhook-event-lease-secs').value = item.webhook_event_lease_secs;
+      editorTitle.textContent = task ? `编辑任务 #${task.id}` : '新建同步任务';
+    }
+
+    function formTask() {
+      return { enabled: checked('enabled'), item: {
+        source: document.querySelector('#source').value.trim(), target: lines('target'), workspace: document.querySelector('#workspace').value.trim(),
+        mode: document.querySelector('#mode').value, crontab: document.querySelector('#crontab').value.trim() || null, branches: lines('branches'),
+        include_refs: lines('include-refs'), exclude_refs: lines('exclude-refs'), timeout_secs: number('timeout-secs'), dry_run: checked('dry-run'),
+        allow_destructive: checked('allow-destructive'), sync_lfs: checked('sync-lfs'), divergence: document.querySelector('#divergence').value,
+        tag_policy: document.querySelector('#tag-policy').value, prune_branches: checked('prune-branches'), prune_tags: checked('prune-tags'), atomic: checked('atomic'),
+        max_retries: number('max-retries'), retry_backoff_secs: number('retry-backoff-secs'), failure_cooldown_secs: number('failure-cooldown-secs'),
+        webhook_secret_envs: lines('webhook-secret-envs'), webhook_max_pending_events: number('webhook-max-pending-events'), webhook_event_lease_secs: number('webhook-event-lease-secs')
+      }};
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const id = document.querySelector('#task-id').value;
+      try {
+        await request(id ? `/api/tasks/${id}` : '/api/tasks', { method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(formTask()) });
+        message.textContent = '任务已保存并立即生效'; message.className = 'muted'; setForm(); await load();
+      } catch (error) { message.textContent = `保存失败：${error.message}`; message.className = 'error'; }
+    });
+
+    authForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const initialized = passwordConfirmField.hidden;
+      const password = document.querySelector('#password').value;
+      if (!initialized && password !== document.querySelector('#password-confirm').value) {
+        message.textContent = '两次密码不一致'; message.className = 'error'; return;
+      }
+      authSubmit.disabled = true;
+      try {
+        await request(initialized ? '/api/auth/setup' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password }) });
+        document.querySelector('#password').value = ''; document.querySelector('#password-confirm').value = '';
+        message.textContent = '登录成功'; message.className = 'muted'; await load();
+      } catch (error) { message.textContent = `${initialized ? '设置失败' : '登录失败'}：${error.message}`; message.className = 'error'; }
+      finally { authSubmit.disabled = false; }
+    });
+
+    tasks.addEventListener('click', async event => {
+      const button = event.target.closest('button[data-action]'); if (!button) return;
+      const id = Number(button.dataset.id); const task = taskRecords.find(value => value.id === id); if (!task) return;
+      try {
+        if (button.dataset.action === 'edit') { setForm(task); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); return; }
+        if (button.dataset.action === 'delete') {
+          if (!window.confirm(`删除任务 #${id}？不会删除 workspace 或运行历史。`)) return;
+          await request(`/api/tasks/${id}`, { method: 'DELETE' });
+        } else {
+          await request(`/api/tasks/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...task, enabled: !task.enabled }) });
+        }
+        setForm(); await load();
+      } catch (error) { message.textContent = `操作失败：${error.message}`; message.className = 'error'; }
+    });
+
+    document.querySelector('#new-task').addEventListener('click', () => { setForm(); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); });
+    document.querySelector('#cancel').addEventListener('click', () => setForm());
+    refresh.addEventListener('click', load);
+    logout.addEventListener('click', async () => { await request('/api/auth/logout', { method: 'POST' }); showAuth(true); message.textContent = '已退出登录'; message.className = 'muted'; });
+    setForm(); initAuth(); setInterval(() => { if (document.visibilityState === 'visible' && !app.hidden) load(); }, 5000);
+  </script>
+</body>
+</html>

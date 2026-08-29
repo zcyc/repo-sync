@@ -1,0 +1,1 @@
+pub(crate) const HTML: &str = include_str!("../dashboard.html");

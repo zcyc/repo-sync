@@ -1,12 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, error::Error, path::Path};
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFile {
-    sync: Vec<Item>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
@@ -56,11 +50,6 @@ pub enum TagPolicy {
     Preserve,
     Fail,
     Force,
-}
-
-pub fn load(path: &str) -> Result<Vec<Item>, Box<dyn Error>> {
-    let config: ConfigFile = toml::from_str(&std::fs::read_to_string(path)?)?;
-    Ok(config.sync)
 }
 
 pub fn validate(config: &[Item]) -> Result<(), Box<dyn Error>> {
@@ -113,6 +102,13 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     }
     if item.webhook_event_lease_secs == 0 {
         return Err("webhook_event_lease_secs must be greater than zero".into());
+    }
+    if item
+        .webhook_secret_envs
+        .iter()
+        .any(|name| name.trim().is_empty())
+    {
+        return Err("webhook_secret_envs cannot contain an empty name".into());
     }
     if item.branches.iter().any(|branch| branch.trim().is_empty()) {
         return Err("branches cannot contain empty patterns".into());
@@ -222,8 +218,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_selected, ref_selected, validate, ConfigFile, DivergencePolicy, Item, SyncMode,
-        TagPolicy,
+        branch_selected, ref_selected, validate, DivergencePolicy, Item, SyncMode, TagPolicy,
     };
 
     fn item() -> Item {
@@ -252,12 +247,6 @@ mod tests {
             webhook_max_pending_events: 10_000,
             webhook_event_lease_secs: 900,
         }
-    }
-
-    #[test]
-    fn validates_example_config() {
-        let config: ConfigFile = toml::from_str(include_str!("../config.toml")).unwrap();
-        assert!(validate(&config.sync).is_ok());
     }
 
     #[test]

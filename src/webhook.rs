@@ -1,10 +1,14 @@
 use crate::{
-    config,
+    config, dashboard,
     state::{self, QueuedEvent, StateDb, WebhookEnqueue, WebhookEventInput, WebhookRefChange},
-    sync, Item,
+    sync,
+    tasks::{self, Task},
+    Item,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hmac::{Hmac, Mac};
+use job_scheduler_ng::{Job, JobScheduler, Schedule};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
@@ -12,6 +16,7 @@ use std::{
     error::Error,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -27,6 +32,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: u64 = 64;
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
+const SECURITY_HEADERS: &str =
+    "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
 
 #[derive(Clone, Debug)]
 struct WebhookEvent {
@@ -46,6 +53,8 @@ struct HttpRequest {
 
 #[derive(Clone)]
 struct WebhookItem {
+    task_id: i64,
+    enabled: bool,
     item: Item,
     secrets: Vec<String>,
 }
@@ -198,6 +207,77 @@ impl Metrics {
     }
 }
 
+#[derive(Serialize)]
+struct DashboardSnapshot {
+    items: Vec<DashboardItem>,
+}
+
+#[derive(Serialize)]
+struct DashboardItem {
+    id: i64,
+    enabled: bool,
+    config: Item,
+    status: state::StatusReport,
+    queue: DashboardQueue,
+    events: Vec<state::WebhookEventStatus>,
+}
+
+#[derive(Deserialize)]
+struct TaskRequest {
+    item: Item,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AuthRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct DashboardQueue {
+    counts: BTreeMap<String, i64>,
+    oldest_pending_age_seconds: f64,
+}
+
+fn dashboard_snapshot(config: &[WebhookItem]) -> Result<String, Box<dyn Error>> {
+    let mut items = Vec::with_capacity(config.len());
+    for webhook_item in config {
+        let item = &webhook_item.item;
+        let queue_stats = state::webhook_queue_stats(Path::new(&item.workspace), &item.source)?;
+        let oldest_pending_age_seconds = queue_stats
+            .oldest_pending_ms
+            .map(|received| state::now_ms().saturating_sub(received).max(0) as f64 / 1000.0)
+            .unwrap_or(0.0);
+        items.push(DashboardItem {
+            id: webhook_item.task_id,
+            enabled: webhook_item.enabled,
+            config: item.clone(),
+            status: state::status(Path::new(&item.workspace), &item.source)?,
+            queue: DashboardQueue {
+                counts: queue_stats.counts,
+                oldest_pending_age_seconds,
+            },
+            events: state::webhook_events(Path::new(&item.workspace), &item.source, 10)?,
+        });
+    }
+    Ok(serde_json::to_string(&DashboardSnapshot { items })?)
+}
+
+fn reload_task_config(
+    database_path: &Path,
+    config_store: &RwLock<Vec<WebhookItem>>,
+) -> Result<(), Box<dyn Error>> {
+    let task_records = tasks::list_tasks(database_path)?;
+    let prepared = prepare_webhook_config(&task_records)?;
+    *config_store.write().expect("webhook config lock poisoned") = prepared;
+    Ok(())
+}
+
+fn task_id_path(path: &str) -> Option<i64> {
+    path.strip_prefix("/api/tasks/")?.parse().ok()
+}
+
 fn counter(output: &mut String, name: &str, help: &str, value: u64) {
     output.push_str(&format!(
         "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n"
@@ -217,13 +297,10 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-pub fn serve(
-    addr: &str,
-    config: Vec<Item>,
-    config_path: Option<&str>,
-    direct_secret: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let config = Arc::new(RwLock::new(prepare_webhook_config(&config, direct_secret)?));
+pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
+    let task_records = tasks::list_tasks(database_path)?;
+    let config = Arc::new(RwLock::new(prepare_webhook_config(&task_records)?));
+    let database_path = database_path.to_owned();
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let metrics = Arc::new(Metrics::default());
@@ -247,18 +324,14 @@ pub fn serve(
     eprintln!("webhook listener started on {addr}");
     while !shutdown.load(Ordering::Relaxed) {
         if reload.swap(false, Ordering::Relaxed) {
-            if let Some(path) = config_path {
-                match config::load(path)
-                    .and_then(|new_config| prepare_webhook_config(&new_config, None))
-                {
-                    Ok(new_config) => {
-                        *config.write().expect("webhook config lock poisoned") = new_config;
-                        eprintln!("webhook configuration reloaded from {path}");
-                    }
-                    Err(error) => eprintln!("webhook configuration reload failed: {error}"),
+            match tasks::list_tasks(&database_path)
+                .and_then(|new_tasks| prepare_webhook_config(&new_tasks))
+            {
+                Ok(new_config) => {
+                    *config.write().expect("webhook config lock poisoned") = new_config;
+                    eprintln!("webhook tasks reloaded from {}", database_path.display());
                 }
-            } else {
-                eprintln!("SIGHUP ignored: direct webhook mode has no config file");
+                Err(error) => eprintln!("webhook task reload failed: {error}"),
             }
         }
         match listener.accept() {
@@ -277,10 +350,11 @@ pub fn serve(
                     continue;
                 }
                 let config = Arc::clone(&config);
+                let database_path = database_path.clone();
                 let metrics = Arc::clone(&metrics);
                 let wake_sender = wake_sender.clone();
                 thread::spawn(move || {
-                    handle_connection(stream, &config, &wake_sender, &metrics);
+                    handle_connection(stream, &config, &database_path, &wake_sender, &metrics);
                     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -296,52 +370,30 @@ pub fn serve(
     Ok(())
 }
 
-fn prepare_webhook_config(
-    config_items: &[Item],
-    direct_secret: Option<&str>,
-) -> Result<Vec<WebhookItem>, Box<dyn Error>> {
-    config::validate(config_items)?;
-    config_items
+fn prepare_webhook_config(task_records: &[Task]) -> Result<Vec<WebhookItem>, Box<dyn Error>> {
+    task_records
         .iter()
-        .map(|item| {
-            let secrets = if let Some(secret) = direct_secret {
-                if secret.is_empty() {
-                    return Err("webhook secret cannot be empty".into());
+        .map(|task| {
+            config::validate_item(&task.item)?;
+            let mut secrets = Vec::new();
+            for env_name in &task.item.webhook_secret_envs {
+                if env_name.trim().is_empty() {
+                    return Err("webhook_secret_envs cannot contain an empty name".into());
                 }
-                vec![secret.to_owned()]
-            } else {
-                let mut secrets = Vec::new();
-                for env_name in &item.webhook_secret_envs {
-                    if env_name.trim().is_empty() {
-                        return Err("webhook_secret_envs cannot contain an empty name".into());
-                    }
-                    let secret = std::env::var(env_name).map_err(|_| {
-                        format!("webhook secret environment variable is not set: {env_name}")
-                    })?;
-                    if secret.is_empty() {
-                        return Err(format!(
-                            "webhook secret environment variable is empty: {env_name}"
-                        )
-                        .into());
-                    }
-                    if !secrets.contains(&secret) {
+                match std::env::var(env_name) {
+                    Ok(secret) if !secret.is_empty() && !secrets.contains(&secret) => {
                         secrets.push(secret);
                     }
+                    Ok(_) => eprintln!("webhook secret environment variable is empty: {env_name}"),
+                    Err(_) => {
+                        eprintln!("webhook secret environment variable is not set: {env_name}")
+                    }
                 }
-                if secrets.is_empty() {
-                    return Err(format!(
-                        "webhook_secret_envs is required for workspace {}",
-                        item.workspace
-                    )
-                    .into());
-                }
-                secrets
-            };
-            let db = StateDb::open(std::path::Path::new(&item.workspace), &item.source)?;
-            let now = state::now_ms();
-            db.recover_webhook_events(&item.source, now)?;
+            }
             Ok(WebhookItem {
-                item: item.clone(),
+                task_id: task.id,
+                enabled: task.enabled,
+                item: task.item.clone(),
                 secrets,
             })
         })
@@ -391,9 +443,43 @@ fn worker_loop(
     shutdown: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 ) {
+    let mut schedule = JobScheduler::new();
+    let mut schedule_signature = Vec::new();
     while !shutdown.load(Ordering::Relaxed) {
         let items = config.read().expect("webhook config lock poisoned").clone();
+        let next_signature = items
+            .iter()
+            .map(|item| {
+                (
+                    item.task_id,
+                    item.enabled,
+                    serde_json::to_string(&item.item).unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if next_signature != schedule_signature {
+            schedule = JobScheduler::new();
+            for item in &items {
+                if !item.enabled {
+                    continue;
+                }
+                let Some(crontab) = item.item.crontab.as_deref() else {
+                    continue;
+                };
+                let Ok(crontab) = crontab.parse::<Schedule>() else {
+                    eprintln!("invalid schedule for task {}", item.task_id);
+                    continue;
+                };
+                let item = item.item.clone();
+                schedule.add(Job::new(crontab, move || run_scheduled_item(&item)));
+            }
+            schedule_signature = next_signature;
+        }
+        schedule.tick();
         for item in &items {
+            if !item.enabled {
+                continue;
+            }
             if let Err(error) = process_item(&item.item, None, Some(&metrics)) {
                 eprintln!("webhook worker failed for {}: {error}", item.item.workspace);
             }
@@ -402,6 +488,25 @@ fn worker_loop(
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+fn run_scheduled_item(item: &Item) {
+    match state::cooldown_active(
+        Path::new(&item.workspace),
+        &item.source,
+        &item.target,
+        item.failure_cooldown_secs,
+    ) {
+        Ok(true) => {
+            eprintln!("sync {} paused by failure cooldown", item.workspace);
+            return;
+        }
+        Err(error) => eprintln!("sync {} cooldown check failed: {error}", item.workspace),
+        Ok(false) => {}
+    }
+    if let Err(error) = sync::sync(item) {
+        eprintln!("scheduled sync {} failed: {error}", item.workspace);
     }
 }
 
@@ -480,11 +585,11 @@ fn event_retry_delay(backoff_secs: u64, attempts: i64) -> i64 {
 
 fn handle_connection(
     mut stream: TcpStream,
-    config: &RwLock<Vec<WebhookItem>>,
+    config_store: &RwLock<Vec<WebhookItem>>,
+    database_path: &Path,
     wake_sender: &Sender<()>,
     metrics: &Metrics,
 ) {
-    let config = config.read().expect("webhook config lock poisoned").clone();
     metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -504,6 +609,10 @@ fn handle_connection(
         return;
     }
     if request.method == "GET" && path == "/metrics" {
+        let config = config_store
+            .read()
+            .expect("webhook config lock poisoned")
+            .clone();
         write_response_with_type(
             &mut stream,
             "200 OK",
@@ -512,11 +621,218 @@ fn handle_connection(
         );
         return;
     }
+    if request.method == "GET" && path == "/" {
+        write_response_with_type(
+            &mut stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            dashboard::HTML,
+        );
+        return;
+    }
+    if path.starts_with("/api/auth/") {
+        handle_auth_request(&mut stream, database_path, &request, path, metrics);
+        return;
+    }
+    if path.starts_with("/api/") {
+        let authenticated = session_token(&request.headers).is_some_and(|token| {
+            tasks::authenticate_session(database_path, token)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        if !authenticated {
+            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            write_response(&mut stream, "401 Unauthorized", "login required");
+            return;
+        }
+        match (request.method.as_str(), path) {
+            ("GET", "/api/status") => {
+                let config = config_store
+                    .read()
+                    .expect("webhook config lock poisoned")
+                    .clone();
+                match dashboard_snapshot(&config) {
+                    Ok(body) => write_response_with_type(
+                        &mut stream,
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &body,
+                    ),
+                    Err(error) => {
+                        eprintln!("dashboard status failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "status unavailable",
+                        );
+                    }
+                }
+            }
+            ("GET", "/api/tasks") => match tasks::list_tasks(database_path) {
+                Ok(task_records) => match serde_json::to_string(&task_records) {
+                    Ok(body) => write_response_with_type(
+                        &mut stream,
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &body,
+                    ),
+                    Err(error) => {
+                        eprintln!("dashboard task serialization failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "tasks unavailable",
+                        );
+                    }
+                },
+                Err(error) => {
+                    eprintln!("dashboard task read failed: {error}");
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "tasks unavailable",
+                    );
+                }
+            },
+            ("POST", "/api/tasks") => match serde_json::from_slice::<TaskRequest>(&request.body) {
+                Ok(task_request) => match tasks::create_task(
+                    database_path,
+                    &task_request.item,
+                    task_request.enabled,
+                ) {
+                    Ok(task) => match reload_task_config(database_path, config_store) {
+                        Ok(()) => match serde_json::to_string(&task) {
+                            Ok(body) => write_response_with_type(
+                                &mut stream,
+                                "201 Created",
+                                "application/json; charset=utf-8",
+                                &body,
+                            ),
+                            Err(error) => {
+                                eprintln!("dashboard task serialization failed: {error}");
+                                write_response(
+                                    &mut stream,
+                                    "500 Internal Server Error",
+                                    "task unavailable",
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("dashboard task reload failed: {error}");
+                            write_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                "task reload failed",
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("dashboard task create failed: {error}");
+                        write_response(&mut stream, "400 Bad Request", "invalid task");
+                    }
+                },
+                Err(error) => {
+                    eprintln!("dashboard task request failed: {error}");
+                    write_response(&mut stream, "400 Bad Request", "invalid task request");
+                }
+            },
+            ("PUT", task_path) => {
+                let Some(task_id) = task_id_path(task_path) else {
+                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                    write_response(&mut stream, "404 Not Found", "unknown task");
+                    return;
+                };
+                match serde_json::from_slice::<TaskRequest>(&request.body) {
+                    Ok(task_request) => match tasks::update_task(
+                        database_path,
+                        task_id,
+                        &task_request.item,
+                        task_request.enabled,
+                    ) {
+                        Ok(Some(task)) => match reload_task_config(database_path, config_store) {
+                            Ok(()) => match serde_json::to_string(&task) {
+                                Ok(body) => write_response_with_type(
+                                    &mut stream,
+                                    "200 OK",
+                                    "application/json; charset=utf-8",
+                                    &body,
+                                ),
+                                Err(error) => {
+                                    eprintln!("dashboard task serialization failed: {error}");
+                                    write_response(
+                                        &mut stream,
+                                        "500 Internal Server Error",
+                                        "task unavailable",
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                eprintln!("dashboard task reload failed: {error}");
+                                write_response(
+                                    &mut stream,
+                                    "500 Internal Server Error",
+                                    "task reload failed",
+                                );
+                            }
+                        },
+                        Ok(None) => write_response(&mut stream, "404 Not Found", "unknown task"),
+                        Err(error) => {
+                            eprintln!("dashboard task update failed: {error}");
+                            write_response(&mut stream, "400 Bad Request", "invalid task");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("dashboard task request failed: {error}");
+                        write_response(&mut stream, "400 Bad Request", "invalid task request");
+                    }
+                }
+            }
+            ("DELETE", task_path) => {
+                let Some(task_id) = task_id_path(task_path) else {
+                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                    write_response(&mut stream, "404 Not Found", "unknown task");
+                    return;
+                };
+                match tasks::delete_task(database_path, task_id) {
+                    Ok(true) => match reload_task_config(database_path, config_store) {
+                        Ok(()) => write_response(&mut stream, "204 No Content", ""),
+                        Err(error) => {
+                            eprintln!("dashboard task reload failed: {error}");
+                            write_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                "task reload failed",
+                            );
+                        }
+                    },
+                    Ok(false) => write_response(&mut stream, "404 Not Found", "unknown task"),
+                    Err(error) => {
+                        eprintln!("dashboard task delete failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "task delete failed",
+                        );
+                    }
+                }
+            }
+            _ => {
+                metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                write_response(&mut stream, "404 Not Found", "unknown dashboard endpoint");
+            }
+        }
+        return;
+    }
     if request.method != "POST" {
         metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "405 Method Not Allowed", "POST required");
         return;
     }
+    let config = config_store
+        .read()
+        .expect("webhook config lock poisoned")
+        .clone();
     let event = match parse_event(&request.headers, &request.body) {
         Ok(event) => event,
         Err(error) => {
@@ -542,6 +858,9 @@ fn handle_connection(
     let mut authenticated = false;
     let mut queue_full = false;
     for webhook_item in &config {
+        if !webhook_item.enabled || webhook_item.secrets.is_empty() {
+            continue;
+        }
         if !item_matches(&webhook_item.item, &event) {
             continue;
         }
@@ -619,6 +938,114 @@ fn handle_connection(
         metrics.ignored_events.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "202 Accepted", "event ignored");
     }
+}
+
+fn handle_auth_request(
+    stream: &mut TcpStream,
+    database_path: &Path,
+    request: &HttpRequest,
+    path: &str,
+    metrics: &Metrics,
+) {
+    match (request.method.as_str(), path) {
+        ("GET", "/api/auth/status") => match tasks::auth_initialized(database_path) {
+            Ok(initialized) => write_response_with_type(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &format!(r#"{{"initialized":{initialized}}}"#),
+            ),
+            Err(error) => {
+                eprintln!("auth status failed: {error}");
+                write_response(stream, "500 Internal Server Error", "auth unavailable");
+            }
+        },
+        ("POST", "/api/auth/setup") => {
+            if matches!(tasks::auth_initialized(database_path), Ok(true)) {
+                write_response(
+                    stream,
+                    "409 Conflict",
+                    "admin account is already initialized",
+                );
+                return;
+            }
+            let credentials = match serde_json::from_slice::<AuthRequest>(&request.body) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    eprintln!("auth setup request failed: {error}");
+                    write_response(stream, "400 Bad Request", "invalid credentials");
+                    return;
+                }
+            };
+            match tasks::setup_admin(database_path, &credentials.username, &credentials.password) {
+                Ok(session) => write_session_response(stream, "201 Created", &session),
+                Err(error) => {
+                    eprintln!("auth setup failed: {error}");
+                    write_response(stream, "400 Bad Request", "invalid credentials");
+                }
+            }
+        }
+        ("POST", "/api/auth/login") => {
+            let credentials = match serde_json::from_slice::<AuthRequest>(&request.body) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    eprintln!("auth login request failed: {error}");
+                    write_response(stream, "400 Bad Request", "invalid credentials");
+                    return;
+                }
+            };
+            match tasks::login_admin(database_path, &credentials.username, &credentials.password) {
+                Ok(session) => write_session_response(stream, "200 OK", &session),
+                Err(_) => write_response(stream, "401 Unauthorized", "invalid credentials"),
+            }
+        }
+        ("POST", "/api/auth/logout") => {
+            if let Some(token) = session_token(&request.headers) {
+                if let Err(error) = tasks::logout_session(database_path, token) {
+                    eprintln!("auth logout failed: {error}");
+                }
+            }
+            write_response_with_cookie(
+                stream,
+                "204 No Content",
+                "text/plain; charset=utf-8",
+                "",
+                "repo_sync_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/",
+            );
+        }
+        _ => {
+            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            write_response(stream, "404 Not Found", "unknown auth endpoint");
+        }
+    }
+}
+
+fn session_token(headers: &BTreeMap<String, String>) -> Option<&str> {
+    headers
+        .get("cookie")?
+        .split(';')
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix("repo_sync_session="))
+        .filter(|token| !token.is_empty())
+}
+
+fn write_session_response(stream: &mut TcpStream, status: &str, session: &tasks::LoginSession) {
+    let body = format!(
+        r#"{{"username":{}}}"#,
+        serde_json::to_string(&session.username).unwrap_or_else(|_| "\"admin\"".into())
+    );
+    let cookie = format!(
+        "repo_sync_session={}; Max-Age={}; HttpOnly; SameSite=Strict; Path=/",
+        session.token,
+        12 * 60 * 60
+    );
+    write_response_with_cookie(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        &body,
+        &cookie,
+    );
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
@@ -1038,9 +1465,24 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 fn write_response_with_type(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
+    write_response_with_cookie(stream, status, content_type, body, "");
+}
+
+fn write_response_with_cookie(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    cookie: &str,
+) {
+    let cookie_header = if cookie.is_empty() {
+        String::new()
+    } else {
+        format!("Set-Cookie: {cookie}\r\n")
+    };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{SECURITY_HEADERS}Cache-Control: no-store\r\n{cookie_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
     );
     let _ = stream.write_all(response.as_bytes());
 }

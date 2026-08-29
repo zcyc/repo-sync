@@ -395,20 +395,6 @@ impl StateDb {
         Ok(WebhookEnqueue::Enqueued)
     }
 
-    pub(crate) fn recover_webhook_events(
-        &self,
-        source: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<usize> {
-        self.connection.execute(
-            "UPDATE webhook_events
-             SET status = 'queued', started_ms = NULL, next_attempt_ms = ?2,
-                 last_error = 'worker restarted while event was running'
-             WHERE source = ?1 AND status = 'running' AND next_attempt_ms <= ?2",
-            params![source, now_ms],
-        )
-    }
-
     pub(crate) fn claim_webhook_event(
         &mut self,
         source: &str,
@@ -1161,7 +1147,6 @@ mod tests {
             .claim_webhook_event(source, now, 10, None)
             .unwrap()
             .unwrap();
-        assert_eq!(db.recover_webhook_events(source, now + 11).unwrap(), 1);
         let reclaimed = db
             .claim_webhook_event(source, now + 11, 10, None)
             .unwrap()
