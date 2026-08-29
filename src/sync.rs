@@ -594,7 +594,7 @@ fn configure_target_remote(
     timeout: Duration,
     retry: RetryPolicy,
 ) -> io::Result<()> {
-    if git::remote_exists(repo_dir, remote)? {
+    if git::remote_exists(repo_dir, remote, timeout, retry)? {
         git::run(
             repo_dir,
             &["remote", "set-url", remote, target],

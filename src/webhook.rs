@@ -31,6 +31,8 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: u64 = 64;
+const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 const LOGIN_FAILURE_LIMIT: u32 = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
@@ -1509,26 +1511,28 @@ fn write_session_response(stream: &mut TcpStream, status: &str, session: &tasks:
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| "request setup failed")?;
+    let deadline = Instant::now() + REQUEST_TOTAL_TIMEOUT;
     let mut request = Vec::new();
     let mut buffer = [0; 8192];
-    let header_end = loop {
-        if request.len() > MAX_HEADER_BYTES {
-            return Err("request headers too large");
+    let mut read = |buffer: &mut [u8]| -> Result<usize, &'static str> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("request read timed out");
         }
-        let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-            let size = stream
-                .read(&mut buffer)
-                .map_err(|_| "request read failed")?;
-            if size == 0 {
-                return Err("incomplete request");
-            }
-            request.extend_from_slice(&buffer[..size]);
-            continue;
-        };
-        break offset + 4;
+        stream
+            .set_read_timeout(Some(remaining.min(REQUEST_IDLE_TIMEOUT)))
+            .map_err(|_| "request setup failed")?;
+        stream.read(buffer).map_err(|_| "request read failed")
+    };
+    let header_end = loop {
+        if let Some(header_end) = request_header_end(&request)? {
+            break header_end;
+        }
+        let size = read(&mut buffer)?;
+        if size == 0 {
+            return Err("incomplete request");
+        }
+        request.extend_from_slice(&buffer[..size]);
     };
     let header_text =
         std::str::from_utf8(&request[..header_end - 4]).map_err(|_| "invalid headers")?;
@@ -1554,9 +1558,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
         .checked_add(body_length)
         .ok_or("request too large")?;
     while request.len() < required {
-        let size = stream
-            .read(&mut buffer)
-            .map_err(|_| "request read failed")?;
+        let size = read(&mut buffer)?;
         if size == 0 {
             return Err("incomplete request body");
         }
@@ -1571,6 +1573,20 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
         headers,
         body: request[header_end..required].to_vec(),
     })
+}
+
+fn request_header_end(request: &[u8]) -> Result<Option<usize>, &'static str> {
+    if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+        let header_end = offset + 4;
+        if header_end > MAX_HEADER_BYTES {
+            return Err("request headers too large");
+        }
+        return Ok(Some(header_end));
+    }
+    if request.len() >= MAX_HEADER_BYTES {
+        return Err("request headers too large");
+    }
+    Ok(None)
 }
 
 fn parse_event(
@@ -1978,8 +1994,8 @@ fn write_response_with_cookie_and_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_label, parse_event, should_coalesce_webhook_events, verify_event,
-        verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
+        escape_label, parse_event, request_header_end, should_coalesce_webhook_events,
+        verify_event, verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
     };
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2005,6 +2021,17 @@ mod tests {
         assert!(!should_coalesce_webhook_events(true, true, true));
         assert!(should_coalesce_webhook_events(true, true, false));
         assert!(!should_coalesce_webhook_events(false, true, false));
+    }
+
+    #[test]
+    fn rejects_headers_larger_than_limit_after_a_single_read() {
+        let mut request = b"GET / HTTP/1.1\r\nX-Test: ".to_vec();
+        request.resize(super::MAX_HEADER_BYTES - 2, b'a');
+        request.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            request_header_end(&request),
+            Err("request headers too large")
+        ));
     }
 
     #[test]

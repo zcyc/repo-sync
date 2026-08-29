@@ -143,11 +143,13 @@ pub(crate) fn status(dir: &Path, args: &[&str], timeout: Duration) -> io::Result
     wait_for_exit(&mut child, timeout)
 }
 
-pub(crate) fn remote_exists(dir: &Path, name: &str) -> io::Result<bool> {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(["remote"])
-        .output()?;
+pub(crate) fn remote_exists(
+    dir: &Path,
+    name: &str,
+    timeout: Duration,
+    retry: RetryPolicy,
+) -> io::Result<bool> {
+    let output = output(dir, &["remote"], timeout, retry)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "git remote failed with {}",
@@ -189,7 +191,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
 struct ManagedChild {
     child: Child,
     #[cfg(windows)]
-    job: WindowsJob,
+    job: Option<WindowsJob>,
 }
 
 impl ManagedChild {
@@ -200,16 +202,27 @@ impl ManagedChild {
         let child = command.spawn()?;
         #[cfg(windows)]
         {
-            let job = match WindowsJob::attach(&child) {
-                Ok(job) => job,
+            let inherited_job = match is_process_in_job(&child) {
+                Ok(inherited_job) => inherited_job,
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);
                 }
             };
-            if let Err(error) = job.resume(&child) {
-                job.terminate();
+            let job = match WindowsJob::attach(&child) {
+                Ok(job) => Some(job),
+                Err(_error) if inherited_job => None,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = resume_process(&child) {
+                if let Some(job) = &job {
+                    job.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
@@ -259,55 +272,71 @@ impl WindowsJob {
             Ok(job)
         }
     }
+}
 
-    fn resume(&self, child: &Child) -> io::Result<()> {
-        use std::mem::size_of;
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-        };
-        use windows_sys::Win32::System::Threading::{
-            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-        };
+#[cfg(windows)]
+fn is_process_in_job(child: &Child) -> io::Result<bool> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if snapshot == INVALID_HANDLE_VALUE {
+    unsafe {
+        let mut in_job = 0;
+        if IsProcessInJob(child.as_raw_handle(), null_mut(), &mut in_job) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(in_job != 0)
+    }
+}
+
+#[cfg(windows)]
+fn resume_process(child: &Child) -> io::Result<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            let mut entry = THREADENTRY32 {
+                dwSize: size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            if Thread32First(snapshot, &mut entry) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let result = (|| {
-                let mut entry = THREADENTRY32 {
-                    dwSize: size_of::<THREADENTRY32>() as u32,
-                    ..Default::default()
-                };
-                if Thread32First(snapshot, &mut entry) == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                loop {
-                    if entry.th32OwnerProcessID == child.id() {
-                        let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
-                        if thread.is_null() {
-                            return Err(io::Error::last_os_error());
-                        }
-                        let result = if ResumeThread(thread) == u32::MAX {
-                            Err(io::Error::last_os_error())
-                        } else {
-                            Ok(())
-                        };
-                        let _ = CloseHandle(thread);
-                        return result;
+            loop {
+                if entry.th32OwnerProcessID == child.id() {
+                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                    if thread.is_null() {
+                        return Err(io::Error::last_os_error());
                     }
-                    if Thread32Next(snapshot, &mut entry) == 0 {
-                        break;
-                    }
+                    let result = if ResumeThread(thread) == u32::MAX {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    };
+                    let _ = CloseHandle(thread);
+                    return result;
                 }
-                Err(io::Error::other("git process main thread not found"))
-            })();
-            let _ = CloseHandle(snapshot);
-            result
-        }
+                if Thread32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+            Err(io::Error::other("git process main thread not found"))
+        })();
+        let _ = CloseHandle(snapshot);
+        result
     }
+}
 
+#[cfg(windows)]
+impl WindowsJob {
     fn terminate(&self) {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
@@ -361,9 +390,24 @@ fn kill_process_group(child: &mut ManagedChild) {
             .status();
     }
     #[cfg(windows)]
-    child.job.terminate();
+    if let Some(job) = &child.job {
+        job.terminate();
+    } else {
+        terminate_process_tree(child.child.id());
+    }
     let _ = child.child.kill();
     let _ = child.child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn output_once(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<Output> {
@@ -592,11 +636,7 @@ mod tests {
             .unwrap()
             .success());
         let hook = root.join(".git/hooks/pre-commit");
-        fs::write(
-            &hook,
-            "#!/bin/sh\npython3 -c 'import os,time; child=os.fork(); os._exit(0) if child else time.sleep(2)'\n",
-        )
-        .unwrap();
+        fs::write(&hook, "#!/bin/sh\n(sleep 2) &\n").unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         root
     }
@@ -639,13 +679,10 @@ mod tests {
     #[test]
     fn cancellation_interrupts_descendant_pipe_wait() {
         let root = repository_with_background_hook();
-        let mut command = Command::new("python3");
+        let mut command = Command::new("sh");
         command
             .process_group(0)
-            .args([
-                "-c",
-                "import os,time; child=os.fork(); os._exit(0) if child else time.sleep(2)",
-            ])
+            .args(["-c", "(sleep 2) &"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = ManagedChild::spawn(&mut command).unwrap();
