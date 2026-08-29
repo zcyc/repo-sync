@@ -16,6 +16,8 @@ pub struct Item {
     pub mode: SyncMode,
     pub crontab: Option<String>,
     pub branches: Vec<String>,
+    pub include_refs: Vec<String>,
+    pub exclude_refs: Vec<String>,
     pub timeout_secs: u64,
     pub dry_run: bool,
     pub allow_destructive: bool,
@@ -27,6 +29,7 @@ pub struct Item {
     pub atomic: bool,
     pub max_retries: u32,
     pub retry_backoff_secs: u64,
+    pub failure_cooldown_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
@@ -105,6 +108,17 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     if item.branches.iter().any(|branch| branch.trim().is_empty()) {
         return Err("branches cannot contain empty patterns".into());
     }
+    for (name, patterns) in [
+        ("include_refs", &item.include_refs),
+        ("exclude_refs", &item.exclude_refs),
+    ] {
+        if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
+            return Err(format!("{name} cannot contain empty patterns").into());
+        }
+        if patterns.iter().any(|pattern| !pattern.starts_with("refs/")) {
+            return Err(format!("{name} patterns must start with refs/").into());
+        }
+    }
     for value in [&item.source].into_iter().chain(item.target.iter()) {
         validate_repository_url(value)?;
     }
@@ -150,6 +164,20 @@ pub(crate) fn branch_selected(patterns: &[String], branch: &str) -> bool {
     patterns.is_empty() || patterns.iter().any(|pattern| glob_matches(pattern, branch))
 }
 
+pub(crate) fn ref_selected(
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    reference: &str,
+) -> bool {
+    (include_patterns.is_empty()
+        || include_patterns
+            .iter()
+            .any(|pattern| glob_matches(pattern, reference)))
+        && !exclude_patterns
+            .iter()
+            .any(|pattern| glob_matches(pattern, reference))
+}
+
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let value = value.chars().collect::<Vec<_>>();
@@ -185,7 +213,8 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_selected, validate, ConfigFile, DivergencePolicy, Item, SyncMode, TagPolicy,
+        branch_selected, ref_selected, validate, ConfigFile, DivergencePolicy, Item, SyncMode,
+        TagPolicy,
     };
 
     fn item() -> Item {
@@ -196,6 +225,8 @@ mod tests {
             mode: SyncMode::Branch,
             crontab: None,
             branches: vec!["main".into()],
+            include_refs: Vec::new(),
+            exclude_refs: Vec::new(),
             timeout_secs: 300,
             dry_run: false,
             allow_destructive: false,
@@ -207,6 +238,7 @@ mod tests {
             atomic: true,
             max_retries: 3,
             retry_backoff_secs: 5,
+            failure_cooldown_secs: 60,
         }
     }
 
@@ -220,6 +252,15 @@ mod tests {
     fn matches_branch_globs() {
         assert!(branch_selected(&["release/*".into()], "release/2026.08"));
         assert!(!branch_selected(&["main".into()], "develop"));
+    }
+
+    #[test]
+    fn include_refs_override_excluded_refs() {
+        let include = vec!["refs/heads/*".into(), "refs/tags/v*".into()];
+        let exclude = vec!["refs/heads/release/*".into()];
+        assert!(ref_selected(&include, &exclude, "refs/heads/main"));
+        assert!(!ref_selected(&include, &exclude, "refs/heads/release/old"));
+        assert!(ref_selected(&include, &exclude, "refs/tags/v1"));
     }
 
     #[test]

@@ -10,6 +10,8 @@ mode = "branch"
 crontab = "0/10 * * * * ? *"
 # 空数组表示同步 source 的全部分支；也可以写 ["main", "release/*"]。
 branches = []
+include_refs = []
+exclude_refs = []
 timeout_secs = 300
 dry_run = false
 allow_destructive = false
@@ -21,6 +23,7 @@ prune_tags = false
 atomic = true
 max_retries = 3
 retry_backoff_secs = 5
+failure_cooldown_secs = 60
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -30,6 +33,8 @@ workspace = "./repo-sync-mirror"
 mode = "mirror"
 crontab = "0/10 * * * * ? *"
 branches = []
+include_refs = []
+exclude_refs = []
 timeout_secs = 300
 dry_run = true
 allow_destructive = false
@@ -41,3 +46,4 @@ prune_tags = false
 atomic = true
 max_retries = 3
 retry_backoff_secs = 5
+failure_cooldown_secs = 60

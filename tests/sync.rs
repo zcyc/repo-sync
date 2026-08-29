@@ -1,10 +1,15 @@
-use repo_sync::{sync, DivergencePolicy, Item, SyncMode, TagPolicy};
+use repo_sync::{
+    check, cooldown_active, status_report, sync, DivergencePolicy, Item, SyncMode, TagPolicy,
+};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir(PathBuf);
 
@@ -14,8 +19,11 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("repo-sync-test-{}-{suffix}", std::process::id()));
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "repo-sync-test-{}-{suffix}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -54,6 +62,8 @@ fn item(source: &Path, target: &Path, workspace: &Path) -> Item {
         mode: SyncMode::Branch,
         crontab: None,
         branches: Vec::new(),
+        include_refs: Vec::new(),
+        exclude_refs: Vec::new(),
         timeout_secs: 30,
         dry_run: false,
         allow_destructive: false,
@@ -65,7 +75,19 @@ fn item(source: &Path, target: &Path, workspace: &Path) -> Item {
         atomic: true,
         max_retries: 0,
         retry_backoff_secs: 0,
+        failure_cooldown_secs: 0,
     }
+}
+
+fn mirror_item(source: &Path, target: &Path, workspace: &Path) -> Item {
+    let mut item = item(source, target, workspace);
+    item.mode = SyncMode::Mirror;
+    item.include_refs = vec!["refs/heads/*".into(), "refs/tags/*".into()];
+    item.exclude_refs = vec!["refs/heads/feature".into()];
+    item.divergence = DivergencePolicy::Force;
+    item.tag_policy = TagPolicy::Force;
+    item.allow_destructive = true;
+    item
 }
 
 fn setup_source(root: &Path) -> (PathBuf, PathBuf) {
@@ -99,6 +121,11 @@ fn syncs_all_branches_and_tags_then_prunes_target_refs() {
     let target = temp.0.join("target.git");
     let workspace = temp.0.join("workspace");
     git(&temp.0, &["init", "--bare", target.to_str().unwrap()]);
+    fs::write(
+        temp.0.join("workspace.lock"),
+        "pid=999999999 created_ms=0\n",
+    )
+    .unwrap();
 
     sync(&item(&source, &target, &workspace)).unwrap();
     assert_eq!(
@@ -115,9 +142,12 @@ fn syncs_all_branches_and_tags_then_prunes_target_refs() {
         git(&target, &["rev-parse", "refs/tags/v1"]).trim().len(),
         40
     );
-    let state = fs::read_to_string(temp.0.join("workspace.state.toml")).unwrap();
-    assert!(state.contains("status = \"synced\""));
-    assert!(state.contains("refs/heads/feature"));
+    let state = status_report(&workspace, &source.to_string_lossy()).unwrap();
+    assert!(state.initialized);
+    assert_eq!(state.targets[0].status, "synced");
+    assert!(state.targets[0]
+        .synced_refs
+        .contains_key("refs/heads/feature"));
 
     let target_work = temp.0.join("target-work");
     git(
@@ -204,17 +234,88 @@ fn tag_policy_preserves_fails_or_forces_conflicts() {
 
     let mut fail = item(&source, &target, &workspace);
     fail.tag_policy = TagPolicy::Fail;
+    fail.failure_cooldown_secs = 60;
     assert!(sync(&fail).is_err());
-    let state = fs::read_to_string(temp.0.join("workspace.state.toml")).unwrap();
-    assert!(state.contains("status = \"failed\""));
-    assert!(state.contains("target tag is divergent"));
+    let state = status_report(&workspace, &source.to_string_lossy()).unwrap();
+    assert_eq!(state.targets[0].status, "failed");
+    assert!(state.targets[0]
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("target tag is divergent")));
+    assert!(cooldown_active(
+        &workspace,
+        &source.to_string_lossy(),
+        &[target.to_string_lossy().into_owned()],
+        60
+    )
+    .unwrap());
 
     let mut force = item(&source, &target, &workspace);
     force.tag_policy = TagPolicy::Force;
     force.allow_destructive = true;
     sync(&force).unwrap();
+    assert!(!cooldown_active(
+        &workspace,
+        &source.to_string_lossy(),
+        &[target.to_string_lossy().into_owned()],
+        60
+    )
+    .unwrap());
     assert_ne!(
         git(&target, &["rev-parse", "refs/tags/v1"]).trim(),
         conflicting_sha
     );
+}
+
+#[test]
+fn mirror_respects_ref_filters_and_write_preflight() {
+    let temp = TempDir::new();
+    let (source, _) = setup_source(&temp.0);
+    let target = temp.0.join("target.git");
+    let workspace = temp.0.join("mirror-workspace");
+    git(&temp.0, &["init", "--bare", target.to_str().unwrap()]);
+    let mirror = mirror_item(&source, &target, &workspace);
+
+    sync(&mirror).unwrap();
+    assert!(git_output(
+        &target,
+        &["show-ref", "--verify", "--quiet", "refs/heads/main"]
+    )
+    .status
+    .success());
+    assert!(!git_output(
+        &target,
+        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
+    )
+    .status
+    .success());
+    check(&mirror, true).unwrap();
+
+    let target_work = temp.0.join("mirror-target-work");
+    git(
+        &temp.0,
+        &[
+            "clone",
+            target.to_str().unwrap(),
+            target_work.to_str().unwrap(),
+        ],
+    );
+    git(&target_work, &["config", "user.name", "repo-sync test"]);
+    git(
+        &target_work,
+        &["config", "user.email", "repo-sync@example.test"],
+    );
+    git(&target_work, &["switch", "-c", "stale"]);
+    fs::write(target_work.join("stale.txt"), "stale\n").unwrap();
+    git(&target_work, &["add", "."]);
+    git(&target_work, &["commit", "-m", "stale"]);
+    git(&target_work, &["push", "origin", "stale"]);
+
+    sync(&mirror).unwrap();
+    assert!(!git_output(
+        &target,
+        &["show-ref", "--verify", "--quiet", "refs/heads/stale"]
+    )
+    .status
+    .success());
 }

@@ -1,7 +1,7 @@
 use crate::{
     config::{self, DivergencePolicy, Item, SyncMode, TagPolicy},
     git::{self, RetryPolicy},
-    state::{self, StateFile},
+    state::{self, RunSummary, StateDb},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,22 +23,44 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
     };
     let run_id = format!("{}-{}", state::now_ms(), process::id());
     let started = Instant::now();
+    let started_ms = state::now_ms();
     eprintln!("[{run_id}] sync started");
     let _lock = WorkspaceLock::acquire(repo_dir)?;
-    let (state_path, mut sync_state) = state::load(repo_dir)?;
-    if !sync_state.source.is_empty() && sync_state.source != item.source {
-        return Err("state source does not match configuration source".into());
-    }
-    sync_state.source = item.source.clone();
+    let mut state_db = StateDb::open(repo_dir, &item.source)?;
+    state_db.begin_run(&run_id, &item.source, started_ms)?;
 
     if let Err(error) = sync_source(item, repo_dir, timeout, retry) {
-        mark_source_failure(&mut sync_state, &item.target, &error.to_string());
-        let _ = state::save(&state_path, &sync_state);
+        let message = error.to_string();
+        let _ = state_db.mark_source_failure(&item.source, &item.target, &message);
+        let _ = state_db.finish_run(
+            &run_id,
+            state::now_ms(),
+            &RunSummary {
+                status: "failed".into(),
+                pushed_targets: 0,
+                skipped_branches: 0,
+                skipped_tags: 0,
+                failed_targets: item.target.len(),
+                error: Some(message.clone()),
+            },
+        );
         return Err(error.into());
     }
     if let Err(error) = sync_lfs_source(item, repo_dir, timeout, retry) {
-        mark_source_failure(&mut sync_state, &item.target, &error.to_string());
-        let _ = state::save(&state_path, &sync_state);
+        let message = error.to_string();
+        let _ = state_db.mark_source_failure(&item.source, &item.target, &message);
+        let _ = state_db.finish_run(
+            &run_id,
+            state::now_ms(),
+            &RunSummary {
+                status: "failed".into(),
+                pushed_targets: 0,
+                skipped_branches: 0,
+                skipped_tags: 0,
+                failed_targets: item.target.len(),
+                error: Some(message.clone()),
+            },
+        );
         return Err(error.into());
     }
 
@@ -46,8 +68,20 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
         SyncMode::Branch => match source_refs(repo_dir, item, timeout, retry) {
             Ok(source_refs) => Some(source_refs),
             Err(error) => {
-                mark_source_failure(&mut sync_state, &item.target, &error.to_string());
-                let _ = state::save(&state_path, &sync_state);
+                let message = error.to_string();
+                let _ = state_db.mark_source_failure(&item.source, &item.target, &message);
+                let _ = state_db.finish_run(
+                    &run_id,
+                    state::now_ms(),
+                    &RunSummary {
+                        status: "failed".into(),
+                        pushed_targets: 0,
+                        skipped_branches: 0,
+                        skipped_tags: 0,
+                        failed_targets: item.target.len(),
+                        error: Some(message.clone()),
+                    },
+                );
                 return Err(error.into());
             }
         },
@@ -61,11 +95,7 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
     for (index, target) in item.target.iter().enumerate() {
         let remote = format!("target{index}");
         let target_started = Instant::now();
-        let target_state = sync_state.targets.entry(target.clone()).or_default();
-        target_state.last_attempt_ms = state::now_ms();
-        target_state.status = "running".into();
-        target_state.last_error = None;
-        state::save(&state_path, &sync_state)?;
+        state_db.mark_running(&item.source, target, state::now_ms())?;
 
         match sync_target(
             repo_dir,
@@ -80,15 +110,14 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                 pushed_targets += usize::from(outcome.pushed);
                 skipped_branches += outcome.skipped_branches;
                 skipped_tags += outcome.skipped_tags;
-                let target_state = sync_state.targets.get_mut(target).unwrap();
-                target_state.status = if outcome.pushed {
-                    "synced".into()
-                } else {
-                    "skipped".into()
-                };
-                target_state.consecutive_failures = 0;
-                target_state.last_success_ms = Some(state::now_ms());
-                target_state.synced_refs = outcome.synced_refs;
+                state_db.mark_success(
+                    &item.source,
+                    target,
+                    if outcome.pushed { "synced" } else { "skipped" },
+                    target_started.elapsed().as_millis() as i64,
+                    &outcome.synced_refs,
+                    outcome.pushed,
+                )?;
                 eprintln!(
                     "[{run_id}] {remote} complete: pushed={}, skipped_branches={}, skipped_tags={}, elapsed_ms={}",
                     outcome.pushed,
@@ -98,11 +127,13 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                 );
             }
             Err(error) => {
-                let target_state = sync_state.targets.get_mut(target).unwrap();
-                target_state.status = "failed".into();
-                target_state.consecutive_failures =
-                    target_state.consecutive_failures.saturating_add(1);
-                target_state.last_error = Some(error.to_string());
+                let message = error.to_string();
+                state_db.mark_failure(
+                    &item.source,
+                    target,
+                    target_started.elapsed().as_millis() as i64,
+                    &message,
+                )?;
                 eprintln!(
                     "[{run_id}] {remote} failed after {}ms: {error}",
                     target_started.elapsed().as_millis()
@@ -110,7 +141,6 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                 errors.push(format!("{remote}: {error}"));
             }
         }
-        state::save(&state_path, &sync_state)?;
     }
 
     eprintln!(
@@ -118,14 +148,31 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
         errors.len(),
         started.elapsed().as_millis()
     );
-    if errors.is_empty() {
-        Ok(())
+    let run_error = (!errors.is_empty()).then(|| errors.join("; "));
+    state_db.finish_run(
+        &run_id,
+        state::now_ms(),
+        &RunSummary {
+            status: if run_error.is_some() {
+                "failed".into()
+            } else {
+                "succeeded".into()
+            },
+            pushed_targets,
+            skipped_branches,
+            skipped_tags,
+            failed_targets: errors.len(),
+            error: run_error.clone(),
+        },
+    )?;
+    if let Some(error) = run_error {
+        Err(format!("{} target(s) failed: {error}", errors.len()).into())
     } else {
-        Err(format!("{} target(s) failed: {}", errors.len(), errors.join("; ")).into())
+        Ok(())
     }
 }
 
-pub fn check(item: &Item) -> Result<(), Box<dyn Error>> {
+pub fn check(item: &Item, check_write: bool) -> Result<(), Box<dyn Error>> {
     config::validate_item(item)?;
     let timeout = Duration::from_secs(item.timeout_secs);
     let retry = RetryPolicy {
@@ -140,9 +187,14 @@ pub fn check(item: &Item) -> Result<(), Box<dyn Error>> {
         retry,
     )?;
     if matches!(item.mode, SyncMode::Branch)
-        && !source_heads
-            .keys()
-            .any(|branch| config::branch_selected(&item.branches, branch))
+        && !source_heads.keys().any(|branch| {
+            config::branch_selected(&item.branches, branch)
+                && config::ref_selected(
+                    &item.include_refs,
+                    &item.exclude_refs,
+                    &format!("refs/heads/{branch}"),
+                )
+        })
     {
         return Err("no source branches match the configured branches".into());
     }
@@ -168,6 +220,51 @@ pub fn check(item: &Item) -> Result<(), Box<dyn Error>> {
     }
     for target in &item.target {
         git::run(current_dir, &["ls-remote", target], timeout, retry)?;
+    }
+    if check_write {
+        let repo_dir = Path::new(&item.workspace);
+        if !repo_dir.exists() {
+            return Err("--check-write requires an existing workspace".into());
+        }
+        let source = match item.mode {
+            SyncMode::Branch => Some(source_refs(repo_dir, item, timeout, retry)?),
+            SyncMode::Mirror => None,
+        };
+        let (source_ref, destination_ref) = match (&source, item.mode) {
+            (Some(source), SyncMode::Branch) => source
+                .branches
+                .first()
+                .map(|branch| {
+                    (
+                        branch.source_ref.clone(),
+                        format!("refs/heads/{}", branch.branch),
+                    )
+                })
+                .ok_or("no source branch is available for write preflight")?,
+            (None, SyncMode::Mirror) => local_refs(repo_dir, timeout, retry)?
+                .keys()
+                .find(|reference| {
+                    reference.starts_with("refs/heads/")
+                        && config::ref_selected(&item.include_refs, &item.exclude_refs, reference)
+                })
+                .map(|reference| (reference.clone(), reference.clone()))
+                .ok_or("no source branch is available for write preflight")?,
+            _ => unreachable!(),
+        };
+        for (index, target) in item.target.iter().enumerate() {
+            let remote = format!("target{index}");
+            configure_target_remote(repo_dir, &remote, target, timeout, retry)?;
+            let destination = format!("{source_ref}:{destination_ref}");
+            let mut args = vec!["push".to_owned(), "--dry-run".to_owned()];
+            if item.atomic {
+                args.push("--atomic".into());
+            }
+            args.push(remote);
+            args.push(destination);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            git::run(repo_dir, &args, timeout, retry)
+                .map_err(|error| io::Error::other(format!("write preflight failed: {error}")))?;
+        }
     }
     eprintln!("configuration and repository access checks passed");
     Ok(())
@@ -218,12 +315,14 @@ fn source_refs(
             let mut fields = line.split_whitespace();
             let branch = fields.next()?;
             let sha = fields.next()?;
-            (branch != "HEAD" && config::branch_selected(&item.branches, branch)).then(|| {
-                SourceBranch {
-                    branch: branch.into(),
-                    source_ref: format!("refs/remotes/origin/{branch}"),
-                    sha: sha.into(),
-                }
+            let reference = format!("refs/heads/{branch}");
+            (branch != "HEAD"
+                && config::branch_selected(&item.branches, branch)
+                && config::ref_selected(&item.include_refs, &item.exclude_refs, &reference))
+            .then(|| SourceBranch {
+                branch: branch.into(),
+                source_ref: format!("refs/remotes/origin/{branch}"),
+                sha: sha.into(),
             })
         })
         .collect::<Vec<_>>();
@@ -256,10 +355,13 @@ fn source_refs(
             let mut fields = line.split_whitespace();
             let tag = fields.next()?;
             let sha = fields.next()?;
-            Some(SourceTag {
-                tag: tag.into(),
-                source_ref: format!("refs/tags/{tag}"),
-                sha: sha.into(),
+            let reference = format!("refs/tags/{tag}");
+            config::ref_selected(&item.include_refs, &item.exclude_refs, &reference).then(|| {
+                SourceTag {
+                    tag: tag.into(),
+                    source_ref: reference,
+                    sha: sha.into(),
+                }
             })
         })
         .collect::<Vec<_>>();
@@ -375,6 +477,7 @@ struct TargetOutcome {
 struct PushPlan {
     refspecs: Vec<String>,
     leases: Vec<String>,
+    deleted_refs: Vec<String>,
     lfs_refs: Vec<String>,
     synced_refs: BTreeMap<String, String>,
     skipped_branches: usize,
@@ -390,16 +493,7 @@ fn sync_target(
     timeout: Duration,
     retry: RetryPolicy,
 ) -> io::Result<TargetOutcome> {
-    if git::remote_exists(repo_dir, remote)? {
-        git::run(
-            repo_dir,
-            &["remote", "set-url", remote, target],
-            timeout,
-            retry,
-        )?;
-    } else {
-        git::run(repo_dir, &["remote", "add", remote, target], timeout, retry)?;
-    }
+    configure_target_remote(repo_dir, remote, target, timeout, retry)?;
 
     match item.mode {
         SyncMode::Branch => {
@@ -419,6 +513,9 @@ fn sync_target(
                 push_lfs(repo_dir, remote, &plan.lfs_refs, item, timeout, retry)?;
             }
             push_plan(repo_dir, remote, item, &plan, timeout, retry)?;
+            if !item.dry_run {
+                verify_target(repo_dir, remote, &plan, timeout, retry)?;
+            }
             Ok(TargetOutcome {
                 pushed: true,
                 skipped_branches: plan.skipped_branches,
@@ -428,29 +525,50 @@ fn sync_target(
         }
         SyncMode::Mirror => {
             git::run(repo_dir, &["ls-remote", remote], timeout, retry)?;
-            let synced_refs = local_refs(repo_dir, timeout, retry)?;
+            let plan = mirror_plan(repo_dir, remote, item, timeout, retry)?;
+            if plan.refspecs.is_empty() {
+                return Ok(TargetOutcome {
+                    pushed: false,
+                    skipped_branches: 0,
+                    skipped_tags: 0,
+                    synced_refs: plan.synced_refs,
+                });
+            }
             if item.sync_lfs {
-                push_lfs(repo_dir, remote, &[], item, timeout, retry)?;
+                push_lfs(repo_dir, remote, &plan.lfs_refs, item, timeout, retry)?;
             }
-            let mut args = vec!["push".to_owned()];
-            if item.dry_run {
-                args.push("--dry-run".into());
+            push_plan(repo_dir, remote, item, &plan, timeout, retry)?;
+            if !item.dry_run {
+                verify_target(repo_dir, remote, &plan, timeout, retry)?;
             }
-            if item.atomic {
-                args.push("--atomic".into());
-            }
-            args.push("--mirror".into());
-            args.push(remote.into());
-            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-            git::run(repo_dir, &args, timeout, retry)?;
             Ok(TargetOutcome {
                 pushed: true,
                 skipped_branches: 0,
                 skipped_tags: 0,
-                synced_refs,
+                synced_refs: plan.synced_refs,
             })
         }
     }
+}
+
+fn configure_target_remote(
+    repo_dir: &Path,
+    remote: &str,
+    target: &str,
+    timeout: Duration,
+    retry: RetryPolicy,
+) -> io::Result<()> {
+    if git::remote_exists(repo_dir, remote)? {
+        git::run(
+            repo_dir,
+            &["remote", "set-url", remote, target],
+            timeout,
+            retry,
+        )?;
+    } else {
+        git::run(repo_dir, &["remote", "add", remote, target], timeout, retry)?;
+    }
+    Ok(())
 }
 
 fn branch_plan(
@@ -470,6 +588,7 @@ fn branch_plan(
     let mut plan = PushPlan {
         refspecs: Vec::new(),
         leases: Vec::new(),
+        deleted_refs: Vec::new(),
         lfs_refs: Vec::new(),
         synced_refs: BTreeMap::new(),
         skipped_branches: 0,
@@ -518,8 +637,10 @@ fn branch_plan(
     }
     if item.prune_branches {
         for (branch, target_sha) in &target_branches {
+            let reference = format!("refs/heads/{branch}");
             if source_names.contains(branch.as_str())
                 || !config::branch_selected(&item.branches, branch)
+                || !config::ref_selected(&item.include_refs, &item.exclude_refs, &reference)
             {
                 continue;
             }
@@ -527,6 +648,7 @@ fn branch_plan(
             plan.leases.push(format!(
                 "--force-with-lease=refs/heads/{branch}:{target_sha}"
             ));
+            plan.deleted_refs.push(format!("refs/heads/{branch}"));
         }
     }
     Ok(plan)
@@ -556,7 +678,12 @@ fn append_tag_plan(
                     source_tag.sha.clone(),
                 );
             }
-            Some(target_sha) if target_sha == &source_tag.sha => {}
+            Some(target_sha) if target_sha == &source_tag.sha => {
+                plan.synced_refs.insert(
+                    format!("refs/tags/{}", source_tag.tag),
+                    source_tag.sha.clone(),
+                );
+            }
             Some(target_sha) => match item.tag_policy {
                 TagPolicy::Preserve => plan.skipped_tags += 1,
                 TagPolicy::Fail => {
@@ -585,12 +712,16 @@ fn append_tag_plan(
     }
     if item.prune_tags {
         for (tag, target_sha) in target_tags {
-            if source_names.contains(tag.as_str()) {
+            let reference = format!("refs/tags/{tag}");
+            if source_names.contains(tag.as_str())
+                || !config::ref_selected(&item.include_refs, &item.exclude_refs, &reference)
+            {
                 continue;
             }
             plan.refspecs.push(format!(":refs/tags/{tag}"));
             plan.leases
                 .push(format!("--force-with-lease=refs/tags/{tag}:{target_sha}"));
+            plan.deleted_refs.push(format!("refs/tags/{tag}"));
         }
     }
     Ok(())
@@ -727,6 +858,105 @@ fn remote_refs(
         .collect())
 }
 
+fn all_remote_refs(
+    repo_dir: &Path,
+    remote: &str,
+    timeout: Duration,
+    retry: RetryPolicy,
+) -> io::Result<BTreeMap<String, String>> {
+    let output = git::output(repo_dir, &["ls-remote", remote], timeout, retry)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git ls-remote failed with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?;
+            let reference = fields.next()?;
+            if reference.ends_with("^{}") || !reference.starts_with("refs/") {
+                return None;
+            }
+            Some((reference.to_owned(), sha.to_owned()))
+        })
+        .collect())
+}
+
+fn mirror_plan(
+    repo_dir: &Path,
+    remote: &str,
+    item: &Item,
+    timeout: Duration,
+    retry: RetryPolicy,
+) -> io::Result<PushPlan> {
+    let source_refs = local_refs(repo_dir, timeout, retry)?;
+    let target_refs = all_remote_refs(repo_dir, remote, timeout, retry)?;
+    let mut plan = PushPlan {
+        refspecs: Vec::new(),
+        leases: Vec::new(),
+        deleted_refs: Vec::new(),
+        lfs_refs: Vec::new(),
+        synced_refs: BTreeMap::new(),
+        skipped_branches: 0,
+        skipped_tags: 0,
+    };
+    for (reference, sha) in &source_refs {
+        if !config::ref_selected(&item.include_refs, &item.exclude_refs, reference) {
+            continue;
+        }
+        plan.synced_refs.insert(reference.clone(), sha.clone());
+        if target_refs.get(reference) == Some(sha) {
+            continue;
+        }
+        plan.refspecs.push(format!("{reference}:{reference}"));
+        plan.leases.push(format!(
+            "--force-with-lease={reference}:{}",
+            target_refs.get(reference).map(String::as_str).unwrap_or("")
+        ));
+        plan.lfs_refs.push(reference.clone());
+    }
+    for (reference, sha) in &target_refs {
+        if source_refs.contains_key(reference)
+            || !config::ref_selected(&item.include_refs, &item.exclude_refs, reference)
+        {
+            continue;
+        }
+        plan.refspecs.push(format!(":{reference}"));
+        plan.leases
+            .push(format!("--force-with-lease={reference}:{sha}"));
+        plan.deleted_refs.push(reference.clone());
+    }
+    Ok(plan)
+}
+
+fn verify_target(
+    repo_dir: &Path,
+    remote: &str,
+    plan: &PushPlan,
+    timeout: Duration,
+    retry: RetryPolicy,
+) -> io::Result<()> {
+    let actual = all_remote_refs(repo_dir, remote, timeout, retry)?;
+    for (reference, expected_sha) in &plan.synced_refs {
+        if actual.get(reference) != Some(expected_sha) {
+            return Err(io::Error::other(format!(
+                "target verification failed for {reference}"
+            )));
+        }
+    }
+    for reference in &plan.deleted_refs {
+        if actual.contains_key(reference) {
+            return Err(io::Error::other(format!(
+                "target verification found undeleted ref {reference}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn local_refs(
     repo_dir: &Path,
     timeout: Duration,
@@ -753,16 +983,6 @@ fn local_refs(
         .collect())
 }
 
-fn mark_source_failure(state: &mut StateFile, targets: &[String], error: &str) {
-    for target in targets {
-        let target_state = state.targets.entry(target.clone()).or_default();
-        target_state.last_attempt_ms = state::now_ms();
-        target_state.status = "failed".into();
-        target_state.consecutive_failures = target_state.consecutive_failures.saturating_add(1);
-        target_state.last_error = Some(error.into());
-    }
-}
-
 struct WorkspaceLock {
     path: PathBuf,
 }
@@ -774,27 +994,69 @@ impl WorkspaceLock {
         })?;
         let mut path = workspace.to_path_buf();
         path.set_file_name(format!("{}.lock", name.to_string_lossy()));
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("workspace is locked: {}", path.display()),
-                ));
+        for attempt in 0..=1 {
+            let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && attempt == 0
+                        && stale_lock(&path) =>
+                {
+                    fs::remove_file(&path)?;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("workspace is locked: {}", path.display()),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if let Err(error) =
+                writeln!(file, "pid={} created_ms={}", process::id(), state::now_ms())
+            {
+                let _ = fs::remove_file(&path);
+                return Err(error);
             }
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = writeln!(file, "{}", process::id()) {
-            let _ = fs::remove_file(&path);
-            return Err(error);
+            return Ok(Self { path });
         }
-        Ok(Self { path })
+        unreachable!()
     }
 }
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        // ponytail: a crash leaves a stale lock; add PID liveness checks only if this needs recovery.
         let _ = fs::remove_file(&self.path);
     }
+}
+
+fn stale_lock(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut pid = None;
+    let mut created_ms = None;
+    for field in content.split_whitespace() {
+        if let Some(value) = field.strip_prefix("pid=") {
+            pid = value.parse::<u32>().ok();
+        } else if let Some(value) = field.strip_prefix("created_ms=") {
+            created_ms = value.parse::<i64>().ok();
+        }
+    }
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        if std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        return true;
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    created_ms.is_some_and(|created| state::now_ms().saturating_sub(created) > 86_400_000)
 }

@@ -21,6 +21,12 @@ OPTIONS:
         --prune-branches        delete target branches absent from source
         --prune-tags            delete target tags absent from source
         --check                 validate config and repository access only
+        --check-write           also test target write access with a dry-run push
+        --status                show persisted synchronization status
+        --json                  format --status as JSON
+        --serve <ADDR>          listen for generic authenticated HTTP POST triggers
+        --webhook-secret <SECRET>
+                                secret for --serve; or REPO_SYNC_WEBHOOK_SECRET
         --once                  run scheduled items once and exit
     -s, --source <SOURCE>       source repo, eg: https://github.com/zcyc/repo-sync.git
     -t, --target <TARGET>...    target repo, eg: https://github.com/zcyc/repo-sync.git
@@ -30,6 +36,10 @@ OPTIONS:
         --atomic                require atomic target ref updates
         --max-retries <N>       additional retries per Git command
         --retry-backoff-secs <N> initial retry backoff in seconds
+        --failure-cooldown-secs <N>
+                                pause scheduled runs while every target is failing
+        --include-refs <REFS>... full ref glob patterns to include
+        --exclude-refs <REFS>... full ref glob patterns to exclude
         --workspace <PATH>      local checkout path
     -V, --version               Print version information
 ```
@@ -60,6 +70,9 @@ mode = "branch"
 crontab = "0/10 * * * * ? *"
 # 空数组同步全部分支；也可以写 ["main", "release/*"]。
 branches = []
+# 空数组包含全部 refs；exclude_refs 优先级更高。匹配完整 refs 名称。
+include_refs = []
+exclude_refs = []
 timeout_secs = 300
 dry_run = false
 allow_destructive = false
@@ -71,6 +84,7 @@ prune_tags = false
 atomic = true
 max_retries = 3
 retry_backoff_secs = 5
+failure_cooldown_secs = 60
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -80,6 +94,8 @@ workspace = "./repo-sync-mirror"
 mode = "mirror"
 crontab = "0/10 * * * * ? *"
 branches = []
+include_refs = []
+exclude_refs = []
 timeout_secs = 300
 dry_run = true
 allow_destructive = false
@@ -91,6 +107,7 @@ prune_tags = false
 atomic = true
 max_retries = 3
 retry_backoff_secs = 5
+failure_cooldown_secs = 60
 ```
 
 - `source`: The source repository URL
@@ -99,6 +116,8 @@ retry_backoff_secs = 5
 - `mode`: `branch` or `mirror`
 - `crontab`: The schedule for synchronization
 - `branches`: Branch names or glob patterns in `branch` mode. An empty array syncs all source branches; `*` matches any sequence and `?` matches one character.
+- `include_refs`: Full ref glob patterns such as `refs/heads/*` or `refs/tags/v*`. Empty includes all refs handled by the selected mode.
+- `exclude_refs`: Full ref glob patterns to exclude. Exclusions take precedence over inclusions and are never deleted by pruning.
 - `timeout_secs`: Maximum time allowed for each Git command.
 - `dry_run`: Runs Git push with `--dry-run`; source checkout updates can still occur.
 - `allow_destructive`: Must be `true` for a real `mirror` run, tag forcing, or ref pruning.
@@ -110,28 +129,52 @@ retry_backoff_secs = 5
 - `atomic`: Uses `git push --atomic`; the target must support atomic pushes.
 - `max_retries`: Number of additional attempts for failed Git commands, up to 10.
 - `retry_backoff_secs`: Initial exponential backoff between attempts.
-- A `<workspace-name>.state.toml` file is written next to the workspace with the last attempt, result, failure count, error, and synced ref SHAs. Invalid state is reported instead of being silently replaced.
+- `failure_cooldown_secs`: When greater than zero, scheduled runs pause while every target is repeatedly failing; manual `--once` runs are not suppressed.
+- A `<workspace-name>.sqlite3` database is written next to the workspace with target state, run history, errors, durations, and synced ref SHAs. It uses SQLite WAL mode and a busy timeout for safe local readers.
 
-`mirror` mode uses `git clone --mirror`, fetches all refs, and runs
-`git push --mirror`. This can force-update or delete refs on targets; use
-`allow_destructive = true` only when targets are disposable mirrors. The sample
-keeps this mode in dry-run until explicitly enabled. `branch` mode is the safe
-choice for ordinary branch fan-out. Before pushing branches, repo-sync checks
-the target with `git ls-remote` and compares commit ancestry. Existing
+`mirror` mode uses `git clone --mirror`, fetches all refs, and builds an explicit
+ref plan so `include_refs` and `exclude_refs` remain effective. It can
+force-update or delete selected refs on targets; use `allow_destructive = true`
+only when targets are disposable mirrors. The sample keeps this mode in dry-run
+until explicitly enabled. `branch` mode is the safe choice for ordinary branch
+fan-out. Before pushing branches, repo-sync checks the target with `git
+ls-remote` and compares commit ancestry. After a real push it verifies the
+selected target refs again.
+
+`--check` performs read-only source/target access checks. `--check-write`
+requires an existing workspace and performs a target `git push --dry-run`; it
+can change only local remote configuration. `--status` reads the SQLite
+database, and `--status --json` is intended for scripts and monitoring.
+
+`--serve 127.0.0.1:8080 --webhook-secret "$REPO_SYNC_WEBHOOK_SECRET" --file
+config.toml` starts a small generic webhook listener. It accepts authenticated
+`POST` requests containing the `X-Repo-Sync-Secret` header and runs the loaded
+configuration once; request bodies are ignored, so there is no GitHub/GitLab
+payload parsing or provider-specific behavior. The listener is intended to be
+put behind an existing TLS reverse proxy and stops cleanly on Ctrl-C.
+
+`atomic` applies to one Git ref push for one target. Multiple targets, LFS
+transfers, and the SQLite status update are separate operations and are not one
+transaction.
+
+Existing
 workspaces must point to the exact configured source and use the configured
 repository type. Credentials in HTTP(S) URLs are rejected; configure an SSH
 agent or Git credential helper instead. This configuration format is
 intentionally breaking: existing items must add `workspace`, `mode`,
 `timeout_secs`, `dry_run`, `allow_destructive`, `sync_lfs`, `divergence`,
 `tag_policy`, `prune_branches`, `prune_tags`, `atomic`, `max_retries`,
-`retry_backoff_secs`, and replace `branch` with `branches`.
+`retry_backoff_secs`, `failure_cooldown_secs`, `include_refs`,
+`exclude_refs`, and replace `branch` with `branches`. Previous TOML state files
+are not read; the new SQLite database starts a fresh state record.
 
 For one-time runs, omit `crontab`. When using a configuration file, every item
 without a schedule runs once; scheduled items continue running in the scheduler.
 Configuration errors are rejected before any sync starts. A failed target does
 not prevent other targets from being attempted, and Git never waits for an
 interactive terminal credential prompt. Use `--check` for a read-only access
-check and `--once` to execute scheduled items once without entering the loop.
+check, `--check-write` to test target write access, `--status` to inspect state,
+and `--once` to execute scheduled items once without entering the loop.
 
 ## Why Not
 - [git-sync](https://github.com/kubernetes/git-sync) of `kubernetes` only synchronizes the repository into the folder.
