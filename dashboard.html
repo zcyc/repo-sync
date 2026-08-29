@@ -19,7 +19,7 @@
     input[type="checkbox"] { width: 1rem; height: 1rem; }
     input[type="number"] { width: 8rem; }
     input, textarea, select { width: 100%; box-sizing: border-box; }
-    input#username, input#password, input#password-confirm { min-width: 16rem; width: auto; }
+    input#username, input#password, input#password-confirm, input#task-filter { min-width: 16rem; width: auto; }
     textarea { min-height: 5rem; resize: vertical; }
     button { cursor: pointer; background: #1d5fd1; border-color: #1d5fd1; color: #fff; }
     button.secondary { background: #fff; color: #172033; }
@@ -30,7 +30,7 @@
     .error { color: #ae2535; }
     .muted { color: #5c687b; }
     .table-wrap { overflow-x: auto; }
-    table { border-collapse: collapse; width: 100%; min-width: 940px; }
+    table { border-collapse: collapse; width: 100%; min-width: 1120px; }
     th, td { text-align: left; border-bottom: 1px solid #e7eaf0; padding: .7rem .5rem; vertical-align: top; }
     th { color: #5c687b; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
     code, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
@@ -62,6 +62,18 @@
       <p class="muted">SQLite 任务、同步状态和 Webhook 队列</p>
     </div>
     <div class="controls">
+      <label for="task-filter">筛选任务
+        <input id="task-filter" type="search" placeholder="ID、源仓库或 Workspace" autocomplete="off">
+      </label>
+      <label for="status-filter">状态
+        <select id="status-filter">
+          <option value="all">全部</option>
+          <option value="enabled">启用</option>
+          <option value="disabled">停用</option>
+          <option value="failed">失败</option>
+          <option value="queued">有待处理事件</option>
+        </select>
+      </label>
       <button id="refresh" class="secondary" type="button">刷新</button>
       <button id="logout" class="secondary" type="button" hidden>退出登录</button>
     </div>
@@ -198,6 +210,7 @@
     const authForm = document.querySelector('#auth-form');
     const authSubmit = document.querySelector('#auth-submit');
     const passwordForm = document.querySelector('#password-form');
+    const passwordSubmit = passwordForm.querySelector('button[type="submit"]');
     const passwordConfirmField = document.querySelector('#password-confirm-field');
     const logout = document.querySelector('#logout');
     const app = document.querySelector('#app');
@@ -205,6 +218,8 @@
     const form = document.querySelector('#task-form');
     const editorTitle = document.querySelector('#editor-title');
     const refresh = document.querySelector('#refresh');
+    const taskFilter = document.querySelector('#task-filter');
+    const statusFilter = document.querySelector('#status-filter');
     let taskRecords = [];
     let snapshot = [];
 
@@ -218,6 +233,7 @@
     const setLines = (id, values) => { document.querySelector(`#${id}`).value = (values || []).join('\n'); };
     const number = id => Number(document.querySelector(`#${id}`).value);
     const checked = id => document.querySelector(`#${id}`).checked;
+    const formatTime = value => value ? new Date(value).toLocaleString() : '—';
 
     function showAuth(initialized) {
       authPanel.hidden = false; app.hidden = true; logout.hidden = true;
@@ -263,16 +279,35 @@
     }
 
     function render() {
-      tasks.innerHTML = snapshot.length ? snapshot.map(item => {
+      const query = taskFilter.value.trim().toLowerCase();
+      const selectedStatus = statusFilter.value;
+      const visible = snapshot.filter(item => {
+        const config = item.config;
+        const haystack = `${item.id} ${config.source} ${config.workspace}`.toLowerCase();
+        const matchesQuery = !query || haystack.includes(query);
+        const queue = item.queue.counts || {};
+        const matchesStatus = selectedStatus === 'all'
+          || (selectedStatus === 'enabled' && item.enabled)
+          || (selectedStatus === 'disabled' && !item.enabled)
+          || (selectedStatus === 'failed' && item.status.latest_run?.status === 'failed')
+          || (selectedStatus === 'queued' && (queue.queued || 0) > 0);
+        return matchesQuery && matchesStatus;
+      });
+      tasks.innerHTML = visible.length ? visible.map(item => {
         const config = item.config;
         const run = item.status.latest_run;
         const queue = Object.entries(item.queue.counts || {}).map(([key, value]) => `${escapeHtml(key)}=${value}`).join(' · ') || '空';
         const event = item.events[0];
         const state = item.enabled ? '<span class="pill">启用</span>' : '<span class="pill off">停用</span>';
         const record = taskRecords.find(value => value.id === item.id);
-        const updated = record ? new Date(record.updated_ms).toLocaleString() : '—';
-        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${escapeHtml(run?.status || 'none')}<br><span class="muted">${run?.error ? escapeHtml(run.error) : ''}</span></td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td>${escapeHtml(updated)}</td><td class="actions"><button data-action="run" data-id="${item.id}" type="button">立即同步</button><button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
-      }).join('') : '<tr><td colspan="9" class="muted">没有任务，点击“新建任务”开始</td></tr>';
+        const updated = record ? formatTime(record.updated_ms) : '—';
+        const recentRuns = (item.status.recent_runs || []).map(history => `<li><strong>${escapeHtml(history.status)}</strong> · ${escapeHtml(formatTime(history.started_ms))}${history.finished_ms ? ` → ${escapeHtml(formatTime(history.finished_ms))}` : ''}${history.error ? `<br><span class="muted">${escapeHtml(history.error)}</span>` : ''}</li>`).join('');
+        const runDetails = recentRuns ? `<details><summary>${escapeHtml(run?.status || 'none')} · ${escapeHtml(formatTime(run?.started_ms))}</summary><ol>${recentRuns}</ol></details>` : escapeHtml(run?.status || 'none');
+        const retry = event && ['failed', 'dead'].includes(event.status) ? `<button data-action="retry" data-id="${item.id}" data-event-id="${event.event_id}" type="button" class="secondary">重试事件</button>` : '';
+        const cancellable = run?.status === 'running' || ['queued', 'failed', 'running'].some(status => (item.queue.counts?.[status] || 0) > 0);
+        const cancel = cancellable ? `<button data-action="cancel" data-id="${item.id}" type="button" class="secondary">取消执行</button>` : '';
+        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${runDetails}</td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td>${escapeHtml(updated)}</td><td class="actions"><button data-action="run" data-id="${item.id}" type="button">立即同步</button>${cancel}${retry}<button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
+      }).join('') : `<tr><td colspan="9" class="muted">${snapshot.length ? '没有匹配的任务' : '没有任务，点击“新建任务”开始'}</td></tr>`;
     }
 
     function setForm(task) {
@@ -324,9 +359,11 @@
         message.textContent = '两次新密码不一致'; message.className = 'error'; return;
       }
       try {
+        passwordSubmit.disabled = true;
         await request('/api/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) });
         passwordForm.reset(); message.textContent = '密码已修改'; message.className = 'muted';
       } catch (error) { message.textContent = `密码修改失败：${error.message}`; message.className = 'error'; }
+      finally { passwordSubmit.disabled = false; }
     });
 
     authForm.addEventListener('submit', async event => {
@@ -353,6 +390,14 @@
           await request(`/api/tasks/${id}/run`, { method: 'POST' });
           message.textContent = `任务 #${id} 已加入执行队列`; message.className = 'muted'; await load(); return;
         }
+        if (button.dataset.action === 'cancel') {
+          await request(`/api/tasks/${id}/cancel`, { method: 'POST' });
+          message.textContent = `任务 #${id} 已请求取消`; message.className = 'muted'; await load(); return;
+        }
+        if (button.dataset.action === 'retry') {
+          await request(`/api/tasks/${id}/events/${button.dataset.eventId}/retry`, { method: 'POST' });
+          message.textContent = `事件 #${button.dataset.eventId} 已重新加入队列`; message.className = 'muted'; await load(); return;
+        }
         if (button.dataset.action === 'edit') { setForm(task); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); return; }
         if (button.dataset.action === 'delete') {
           if (!window.confirm(`删除任务 #${id}？不会删除 workspace 或运行历史。`)) return;
@@ -367,6 +412,8 @@
     document.querySelector('#new-task').addEventListener('click', () => { setForm(); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); });
     document.querySelector('#cancel').addEventListener('click', () => setForm());
     refresh.addEventListener('click', load);
+    taskFilter.addEventListener('input', render);
+    statusFilter.addEventListener('change', render);
     logout.addEventListener('click', async () => { await request('/api/auth/logout', { method: 'POST' }); showAuth(true); message.textContent = '已退出登录'; message.className = 'muted'; });
     setForm(); initAuth(); setInterval(() => { if (document.visibilityState === 'visible' && !app.hidden) load(); }, 5000);
   </script>

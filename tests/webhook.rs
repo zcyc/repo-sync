@@ -182,6 +182,13 @@ fn accepts_signed_github_webhook_over_http() {
     let run_response = http_request(&address, &run_request, &[]);
     assert!(run_response.starts_with("HTTP/1.1 202 Accepted"));
 
+    let cancel_request = format!(
+        "POST /api/tasks/{}/cancel HTTP/1.1\r\nHost: localhost\r\nCookie: {changed_session}\r\nConnection: close\r\n\r\n",
+        task.id
+    );
+    let cancel_response = http_request(&address, &cancel_request, &[]);
+    assert!(cancel_response.starts_with("HTTP/1.1 202 Accepted"));
+
     let body =
         br#"{"ref":"refs/heads/main","after":"abc","repository":{"full_name":"example/repo"}}"#;
     let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();

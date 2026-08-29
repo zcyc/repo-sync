@@ -1,10 +1,75 @@
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+thread_local! {
+    static CANCELLATION_SCOPE: RefCell<Option<ActiveCancellation>> = const { RefCell::new(None) };
+}
+
+static CANCELLATION_GENERATIONS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
+
+struct ActiveCancellation {
+    workspace: PathBuf,
+    generation: u64,
+}
+
+pub(crate) struct CancellationScope;
+
+impl CancellationScope {
+    pub(crate) fn enter(workspace: &Path) -> Self {
+        let generation = CANCELLATION_GENERATIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("git cancellation lock poisoned")
+            .get(workspace)
+            .copied()
+            .unwrap_or_default();
+        CANCELLATION_SCOPE.with(|scope| {
+            *scope.borrow_mut() = Some(ActiveCancellation {
+                workspace: workspace.to_owned(),
+                generation,
+            })
+        });
+        Self
+    }
+}
+
+impl Drop for CancellationScope {
+    fn drop(&mut self) {
+        CANCELLATION_SCOPE.with(|scope| *scope.borrow_mut() = None);
+    }
+}
+
+pub(crate) fn cancel_workspace(workspace: &Path) {
+    let mut generations = CANCELLATION_GENERATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("git cancellation lock poisoned");
+    let generation = generations.entry(workspace.to_owned()).or_default();
+    *generation = generation.saturating_add(1);
+}
+
+pub(crate) fn cancellation_requested() -> bool {
+    CANCELLATION_SCOPE.with(|scope| {
+        scope.borrow().as_ref().is_some_and(|active| {
+            CANCELLATION_GENERATIONS
+                .get_or_init(|| Mutex::new(BTreeMap::new()))
+                .lock()
+                .expect("git cancellation lock poisoned")
+                .get(&active.workspace)
+                .copied()
+                .unwrap_or_default()
+                != active.generation
+        })
+    })
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RetryPolicy {
@@ -26,13 +91,13 @@ pub(crate) fn run(
                 if attempt == retry.max_retries || !retryable_output(&output) {
                     return Err(io::Error::other(error));
                 }
-                retry_later(args, attempt, retry, &error);
+                retry_later(args, attempt, retry, &error)?;
             }
             Err(error) => {
                 if attempt == retry.max_retries || !retryable_error(&error) {
                     return Err(error);
                 }
-                retry_later(args, attempt, retry, &error.to_string());
+                retry_later(args, attempt, retry, &error.to_string())?;
             }
         }
     }
@@ -53,12 +118,12 @@ pub(crate) fn output(
             }
             Ok(output) => {
                 let error = command_error(args, &output);
-                retry_later(args, attempt, retry, &error);
+                retry_later(args, attempt, retry, &error)?;
             }
             Err(error) if attempt == retry.max_retries || !retryable_error(&error) => {
                 return Err(error)
             }
-            Err(error) => retry_later(args, attempt, retry, &error.to_string()),
+            Err(error) => retry_later(args, attempt, retry, &error.to_string())?,
         }
     }
     unreachable!()
@@ -111,6 +176,11 @@ fn command(dir: &Path, args: &[&str]) -> Command {
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
     let started = Instant::now();
     loop {
+        if cancellation_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "sync cancelled"));
+        }
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
@@ -196,11 +266,11 @@ fn retryable_output(output: &Output) -> bool {
 fn retryable_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
 }
 
-fn retry_later(args: &[&str], attempt: u32, retry: RetryPolicy, error: &str) {
+fn retry_later(args: &[&str], attempt: u32, retry: RetryPolicy, error: &str) -> io::Result<()> {
     let delay = retry_delay(retry, attempt);
     eprintln!(
         "git {} failed (attempt {}/{}): {}; retrying in {}s",
@@ -210,7 +280,14 @@ fn retry_later(args: &[&str], attempt: u32, retry: RetryPolicy, error: &str) {
         error,
         delay.as_secs()
     );
-    thread::sleep(delay);
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        if cancellation_requested() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "sync cancelled"));
+        }
+        thread::sleep((delay - started.elapsed()).min(Duration::from_millis(100)));
+    }
+    Ok(())
 }
 
 fn retry_delay(retry: RetryPolicy, attempt: u32) -> Duration {
@@ -256,4 +333,23 @@ fn redact(value: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cancel_workspace, cancellation_requested, CancellationScope};
+    use std::path::Path;
+
+    #[test]
+    fn cancellation_is_scoped_to_the_active_workspace() {
+        let workspace = Path::new("./git-cancel-test-workspace");
+        {
+            let _scope = CancellationScope::enter(workspace);
+            assert!(!cancellation_requested());
+            cancel_workspace(workspace);
+            assert!(cancellation_requested());
+        }
+        let _scope = CancellationScope::enter(workspace);
+        assert!(!cancellation_requested());
+    }
 }

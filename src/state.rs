@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS metadata (
@@ -88,10 +89,11 @@ pub struct StatusReport {
     pub source: String,
     pub initialized: bool,
     pub latest_run: Option<RunStatus>,
+    pub recent_runs: Vec<RunStatus>,
     pub targets: Vec<TargetStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct RunStatus {
     pub run_id: String,
     pub started_ms: i64,
@@ -211,6 +213,61 @@ impl StateDb {
             )?;
         }
         Ok(Self { connection })
+    }
+
+    fn enqueue_trigger_event(
+        &mut self,
+        source: &str,
+        provider: &str,
+        event_type: &str,
+        delivery_prefix: &str,
+        received_ms: i64,
+        max_pending_events: u64,
+    ) -> rusqlite::Result<WebhookEnqueue> {
+        let delivery_id = format!("{delivery_prefix}-{}", Uuid::new_v4());
+        self.enqueue_webhook_event(
+            WebhookEventInput {
+                source,
+                provider,
+                delivery_id: &delivery_id,
+                event_type,
+                refs_json: "[]",
+                received_ms,
+            },
+            max_pending_events,
+        )
+    }
+
+    pub(crate) fn enqueue_manual_event(
+        &mut self,
+        source: &str,
+        received_ms: i64,
+        max_pending_events: u64,
+    ) -> rusqlite::Result<WebhookEnqueue> {
+        self.enqueue_trigger_event(
+            source,
+            "manual",
+            "manual",
+            "manual",
+            received_ms,
+            max_pending_events,
+        )
+    }
+
+    pub(crate) fn enqueue_scheduled_event(
+        &mut self,
+        source: &str,
+        received_ms: i64,
+        max_pending_events: u64,
+    ) -> rusqlite::Result<WebhookEnqueue> {
+        self.enqueue_trigger_event(
+            source,
+            "schedule",
+            "cron",
+            "schedule",
+            received_ms,
+            max_pending_events,
+        )
     }
 
     pub(crate) fn begin_run(
@@ -461,7 +518,10 @@ impl StateDb {
         finished_ms: i64,
         retry_after_ms: i64,
     ) -> rusqlite::Result<()> {
-        let (status, next_attempt_ms) = if error.is_none() {
+        let cancelled = error == Some("sync cancelled");
+        let (status, next_attempt_ms) = if cancelled {
+            ("cancelled", finished_ms)
+        } else if error.is_none() {
             ("succeeded", finished_ms)
         } else if attempts >= max_attempts {
             ("dead", finished_ms)
@@ -471,10 +531,32 @@ impl StateDb {
         self.connection.execute(
             "UPDATE webhook_events
              SET status = ?2, finished_ms = ?3, next_attempt_ms = ?4, last_error = ?5
-             WHERE event_id = ?1",
+             WHERE event_id = ?1 AND status = 'running'",
             params![event_id, status, finished_ms, next_attempt_ms, error],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn webhook_event_is_running(&self, event_id: i64) -> rusqlite::Result<bool> {
+        let running: i64 = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM webhook_events
+                 WHERE event_id = ?1 AND status = 'running'
+             )",
+            [event_id],
+            |row| row.get(0),
+        )?;
+        Ok(running != 0)
+    }
+
+    pub(crate) fn cancel_webhook_events(&self, source: &str) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE webhook_events
+             SET status = 'cancelled', finished_ms = ?2, next_attempt_ms = ?2,
+                 last_error = 'cancelled by operator'
+             WHERE source = ?1 AND status IN ('queued', 'failed', 'running')",
+            params![source, now_ms()],
+        )
     }
 
     pub(crate) fn retry_webhook_event(
@@ -531,7 +613,7 @@ impl StateDb {
         let transaction = self.connection.transaction()?;
         let events = transaction.execute(
             "DELETE FROM webhook_events
-             WHERE source = ?1 AND status IN ('succeeded', 'coalesced', 'dead')
+             WHERE source = ?1 AND status IN ('succeeded', 'coalesced', 'dead', 'cancelled')
                AND COALESCE(finished_ms, received_ms) < ?2",
             params![source, before_ms],
         )?;
@@ -577,7 +659,11 @@ pub fn check_state(workspace: &Path, source: &str) -> Result<(), Box<dyn Error>>
     if !path.exists() {
         return Ok(());
     }
-    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    check_state_database(&path, source)
+}
+
+fn check_state_database(path: &Path, source: &str) -> Result<(), Box<dyn Error>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     verify_existing_database(&connection, source)?;
     let result: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -596,6 +682,7 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
             source: source.into(),
             initialized: false,
             latest_run: None,
+            recent_runs: Vec::new(),
             targets: Vec::new(),
         });
     }
@@ -603,13 +690,14 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     verify_existing_database(&connection, source)?;
 
-    let latest_run = connection
-        .query_row(
+    let recent_runs = {
+        let mut statement = connection.prepare(
             "SELECT run_id, started_ms, finished_ms, status, pushed_targets,
                     skipped_branches, skipped_tags, failed_targets, error
-             FROM runs WHERE source = ?1 ORDER BY started_ms DESC LIMIT 1",
-            [source],
-            |row| {
+             FROM runs WHERE source = ?1 ORDER BY started_ms DESC LIMIT 20",
+        )?;
+        let rows = statement
+            .query_map([source], |row| {
                 Ok(RunStatus {
                     run_id: row.get(0)?,
                     started_ms: row.get(1)?,
@@ -621,9 +709,11 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
                     failed_targets: row.get(7)?,
                     error: row.get(8)?,
                 })
-            },
-        )
-        .optional()?;
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let latest_run = recent_runs.first().cloned();
 
     let target_rows = {
         let mut statement = connection.prepare(
@@ -685,6 +775,7 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
         source: source.into(),
         initialized: true,
         latest_run,
+        recent_runs,
         targets,
     })
 }
@@ -814,6 +905,15 @@ pub fn retry_webhook_event(
     Ok(db.retry_webhook_event(source, event_id)?)
 }
 
+pub fn cancel_webhook_events(workspace: &Path, source: &str) -> Result<usize, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let db = StateDb::open(workspace, source)?;
+    Ok(db.cancel_webhook_events(source)?)
+}
+
 pub fn prune_history(
     workspace: &Path,
     source: &str,
@@ -859,6 +959,7 @@ pub fn backup_state(
     }
     let db = StateDb::open(workspace, source)?;
     db.backup_into(destination)?;
+    check_state_database(destination, source)?;
     Ok(())
 }
 
@@ -1068,6 +1169,47 @@ mod tests {
     }
 
     #[test]
+    fn trigger_events_are_persistent_and_cancellable() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-manual-event-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://example.test/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(matches!(
+            db.enqueue_scheduled_event(source, super::now_ms(), 10),
+            Ok(WebhookEnqueue::Enqueued)
+        ));
+        assert!(matches!(
+            db.enqueue_manual_event(source, super::now_ms(), 10),
+            Ok(WebhookEnqueue::Enqueued)
+        ));
+        let claimed = db
+            .claim_webhook_event(source, super::now_ms(), 1_000, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.cancel_webhook_events(source).unwrap(), 2);
+        assert!(!db.webhook_event_is_running(claimed.event_id).unwrap());
+        drop(db);
+        let events = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider, "manual");
+        assert_eq!(events[0].status, "cancelled");
+        assert_eq!(events[1].provider, "schedule");
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
     fn maintenance_prunes_finished_history_and_creates_backup() {
         let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1104,13 +1246,30 @@ mod tests {
         db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, Some("failed"), 2, 2)
             .unwrap();
         assert!(matches!(
+            enqueue(&mut db, source, "old-cancelled", "[]", 1, 100),
+            WebhookEnqueue::Enqueued
+        ));
+        let claimed = db
+            .claim_webhook_event(source, now, 1_000, None)
+            .unwrap()
+            .unwrap();
+        db.finish_webhook_event(
+            claimed.event_id,
+            claimed.attempts,
+            1,
+            Some("sync cancelled"),
+            2,
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
             enqueue(&mut db, source, "pending", "[]", now, 100),
             WebhookEnqueue::Enqueued
         ));
         drop(db);
 
         assert!(prune_history(&workspace, source, 1).is_err());
-        assert_eq!(prune_history(&workspace, source, 7).unwrap(), 2);
+        assert_eq!(prune_history(&workspace, source, 7).unwrap(), 3);
         assert_eq!(webhook_events(&workspace, source, 10).unwrap().len(), 1);
         let backup = root.join("backup.sqlite3");
         backup_state(&workspace, source, &backup).unwrap();

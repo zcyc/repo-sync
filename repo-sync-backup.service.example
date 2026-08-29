@@ -1,0 +1,16 @@
+[Unit]
+Description=Backup repo-sync task database
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=repo-sync
+Group=repo-sync
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/repo-sync
+ExecStart=/usr/local/libexec/repo-sync-backup

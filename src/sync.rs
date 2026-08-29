@@ -16,6 +16,7 @@ use std::{
 pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
     config::validate_item(item)?;
     let repo_dir = Path::new(&item.workspace);
+    let _cancellation_scope = git::CancellationScope::enter(repo_dir);
     let timeout = Duration::from_secs(item.timeout_secs);
     let retry = RetryPolicy {
         max_retries: item.max_retries,
@@ -36,7 +37,12 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
             &run_id,
             state::now_ms(),
             &RunSummary {
-                status: "failed".into(),
+                status: if git::cancellation_requested() {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+                .into(),
                 pushed_targets: 0,
                 skipped_branches: 0,
                 skipped_tags: 0,
@@ -53,7 +59,12 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
             &run_id,
             state::now_ms(),
             &RunSummary {
-                status: "failed".into(),
+                status: if git::cancellation_requested() {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+                .into(),
                 pushed_targets: 0,
                 skipped_branches: 0,
                 skipped_tags: 0,
@@ -74,7 +85,12 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                     &run_id,
                     state::now_ms(),
                     &RunSummary {
-                        status: "failed".into(),
+                        status: if git::cancellation_requested() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
                         pushed_targets: 0,
                         skipped_branches: 0,
                         skipped_tags: 0,
@@ -139,6 +155,9 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                     target_started.elapsed().as_millis()
                 );
                 errors.push(format!("{remote}: {error}"));
+                if git::cancellation_requested() {
+                    break;
+                }
             }
         }
     }
@@ -148,12 +167,19 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
         errors.len(),
         started.elapsed().as_millis()
     );
-    let run_error = (!errors.is_empty()).then(|| errors.join("; "));
+    let cancelled = git::cancellation_requested();
+    let run_error = if cancelled {
+        Some("sync cancelled".to_owned())
+    } else {
+        (!errors.is_empty()).then(|| errors.join("; "))
+    };
     state_db.finish_run(
         &run_id,
         state::now_ms(),
         &RunSummary {
-            status: if run_error.is_some() {
+            status: if cancelled {
+                "cancelled".into()
+            } else if run_error.is_some() {
                 "failed".into()
             } else {
                 "succeeded".into()
@@ -165,7 +191,9 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
             error: run_error.clone(),
         },
     )?;
-    if let Some(error) = run_error {
+    if cancelled {
+        Err("sync cancelled".into())
+    } else if let Some(error) = run_error {
         Err(format!("{} target(s) failed: {error}", errors.len()).into())
     } else {
         Ok(())

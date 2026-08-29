@@ -1,5 +1,5 @@
 use crate::{
-    config, dashboard,
+    config, dashboard, git,
     state::{self, QueuedEvent, StateDb, WebhookEnqueue, WebhookEventInput, WebhookRefChange},
     sync,
     tasks::{self, Task},
@@ -65,7 +65,7 @@ struct WebhookItem {
 enum WorkerCommand {
     ConfigChanged,
     Webhook(i64),
-    Manual { task_id: i64, item: Box<Item> },
+    Scheduled(i64),
 }
 
 #[derive(Default)]
@@ -143,6 +143,7 @@ struct Metrics {
     queue_full_events: AtomicU64,
     successful_syncs: AtomicU64,
     failed_syncs: AtomicU64,
+    cancelled_syncs: AtomicU64,
     sync_duration_ms_total: AtomicU64,
     sync_duration_count: AtomicU64,
     collection_errors: AtomicU64,
@@ -211,6 +212,12 @@ impl Metrics {
             "repo_sync_sync_runs_failed_total",
             "Failed sync runs",
             self.failed_syncs.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_sync_runs_cancelled_total",
+            "Cancelled sync runs",
+            self.cancelled_syncs.load(Ordering::Relaxed),
         );
         counter_float(
             &mut output,
@@ -371,6 +378,19 @@ fn run_task_id_path(path: &str) -> Option<i64> {
         .ok()
 }
 
+fn cancel_task_id_path(path: &str) -> Option<i64> {
+    path.strip_prefix("/api/tasks/")?
+        .strip_suffix("/cancel")?
+        .parse()
+        .ok()
+}
+
+fn retry_event_task_path(path: &str) -> Option<(i64, i64)> {
+    let path = path.strip_prefix("/api/tasks/")?.strip_suffix("/retry")?;
+    let (task_id, event_id) = path.split_once("/events/")?;
+    Some((task_id.parse().ok()?, event_id.parse().ok()?))
+}
+
 fn counter(output: &mut String, name: &str, help: &str, value: u64) {
     output.push_str(&format!(
         "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n"
@@ -404,10 +424,12 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_config = Arc::clone(&config);
     let worker_metrics = Arc::clone(&metrics);
+    let worker_wake_sender = wake_sender.clone();
     let worker = thread::spawn(move || {
         worker_loop(
             worker_config,
             wake_receiver,
+            worker_wake_sender,
             worker_shutdown,
             worker_metrics,
         )
@@ -544,6 +566,7 @@ pub fn retry_event(
 fn worker_loop(
     config: Arc<RwLock<Vec<WebhookItem>>>,
     wake_receiver: Receiver<WorkerCommand>,
+    wake_sender: Sender<WorkerCommand>,
     shutdown: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 ) {
@@ -581,8 +604,11 @@ fn worker_loop(
                     eprintln!("invalid schedule for task {}", item.task_id);
                     continue;
                 };
-                let item = item.item.clone();
-                schedule.add(Job::new(crontab, move || run_scheduled_item(&item)));
+                let task_id = item.task_id;
+                let wake_sender = wake_sender.clone();
+                schedule.add(Job::new(crontab, move || {
+                    let _ = wake_sender.send(WorkerCommand::Scheduled(task_id));
+                }));
             }
             schedule_signature = next_signature;
         }
@@ -606,8 +632,23 @@ fn worker_loop(
             Ok(WorkerCommand::Webhook(task_id)) => {
                 pending_tasks.insert(task_id);
             }
-            Ok(WorkerCommand::Manual { task_id, item }) => {
-                run_manual_item(task_id, &item, &metrics);
+            Ok(WorkerCommand::Scheduled(task_id)) => {
+                let Some(item) = items
+                    .iter()
+                    .find(|item| item.task_id == task_id && item.enabled)
+                else {
+                    continue;
+                };
+                match enqueue_scheduled_item(&item.item, &metrics) {
+                    Ok(true) => {
+                        pending_tasks.insert(task_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "scheduled event enqueue failed for {}: {error}",
+                        item.item.workspace
+                    ),
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -615,25 +656,7 @@ fn worker_loop(
     }
 }
 
-fn run_manual_item(task_id: i64, item: &Item, metrics: &Metrics) {
-    let started = Instant::now();
-    let result = sync::sync(item);
-    metrics.sync_duration_ms_total.fetch_add(
-        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        Ordering::Relaxed,
-    );
-    metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
-    if result.is_ok() {
-        metrics.successful_syncs.fetch_add(1, Ordering::Relaxed);
-    } else {
-        metrics.failed_syncs.fetch_add(1, Ordering::Relaxed);
-    }
-    if let Err(error) = result {
-        eprintln!("manual sync task {task_id} failed: {error}");
-    }
-}
-
-fn run_scheduled_item(item: &Item) {
+fn enqueue_scheduled_item(item: &Item, metrics: &Metrics) -> Result<bool, Box<dyn Error>> {
     match state::cooldown_active(
         Path::new(&item.workspace),
         &item.source,
@@ -642,14 +665,43 @@ fn run_scheduled_item(item: &Item) {
     ) {
         Ok(true) => {
             eprintln!("sync {} paused by failure cooldown", item.workspace);
-            return;
+            return Ok(false);
         }
         Err(error) => eprintln!("sync {} cooldown check failed: {error}", item.workspace),
         Ok(false) => {}
     }
-    if let Err(error) = sync::sync(item) {
-        eprintln!("scheduled sync {} failed: {error}", item.workspace);
+    let mut db = StateDb::open(Path::new(&item.workspace), &item.source)?;
+    match db.enqueue_scheduled_event(
+        &item.source,
+        state::now_ms(),
+        item.webhook_max_pending_events,
+    )? {
+        WebhookEnqueue::Enqueued => Ok(true),
+        WebhookEnqueue::Full => {
+            metrics.queue_full_events.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "scheduled sync {} skipped because the queue is full",
+                item.workspace
+            );
+            Ok(false)
+        }
+        WebhookEnqueue::Duplicate => Ok(false),
     }
+}
+
+fn record_sync_metrics(metrics: &Metrics, started: Instant, result: &Result<(), Box<dyn Error>>) {
+    metrics.sync_duration_ms_total.fetch_add(
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
+    match result {
+        Ok(()) => metrics.successful_syncs.fetch_add(1, Ordering::Relaxed),
+        Err(error) if error.to_string() == "sync cancelled" => {
+            metrics.cancelled_syncs.fetch_add(1, Ordering::Relaxed)
+        }
+        Err(_) => metrics.failed_syncs.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 fn process_item(
@@ -671,16 +723,15 @@ fn process_item(
         else {
             return Ok(());
         };
+        if !db.webhook_event_is_running(claimed_id)? {
+            continue;
+        }
         let started = Instant::now();
         let result = sync::sync(item);
-        if let Some(metrics) = metrics {
-            metrics.sync_duration_ms_total.fetch_add(
-                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
-            metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
-        }
         let error = result.as_ref().err().map(ToString::to_string);
+        if let Some(metrics) = metrics {
+            record_sync_metrics(metrics, started, &result);
+        }
         let retry_after =
             state::now_ms().saturating_add(event_retry_delay(item.retry_backoff_secs, attempts));
         db.finish_webhook_event(
@@ -699,13 +750,6 @@ fn process_item(
                 metrics
                     .coalesced_events
                     .fetch_add(coalesced as u64, Ordering::Relaxed);
-            }
-        }
-        if let Some(metrics) = metrics {
-            if result.is_ok() {
-                metrics.successful_syncs.fetch_add(1, Ordering::Relaxed);
-            } else {
-                metrics.failed_syncs.fetch_add(1, Ordering::Relaxed);
             }
         }
         if event_id.is_some() {
@@ -904,17 +948,122 @@ fn handle_connection(
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
                 };
-                let _ = wake_sender.send(WorkerCommand::Manual {
-                    task_id,
-                    item: Box::new(item),
-                });
-                let body = format!(r#"{{"task_id":{task_id},"status":"queued"}}"#);
+                let mut db = match StateDb::open(Path::new(&item.workspace), &item.source) {
+                    Ok(db) => db,
+                    Err(error) => {
+                        eprintln!("manual run state open failed: {error}");
+                        write_response(&mut stream, "500 Internal Server Error", "run unavailable");
+                        return;
+                    }
+                };
+                match db.enqueue_manual_event(
+                    &item.source,
+                    state::now_ms(),
+                    item.webhook_max_pending_events,
+                ) {
+                    Ok(WebhookEnqueue::Enqueued) => {
+                        let _ = wake_sender.send(WorkerCommand::Webhook(task_id));
+                        let body = format!(r#"{{"task_id":{task_id},"status":"queued"}}"#);
+                        write_response_with_type(
+                            &mut stream,
+                            "202 Accepted",
+                            "application/json; charset=utf-8",
+                            &body,
+                        );
+                    }
+                    Ok(WebhookEnqueue::Full) => {
+                        write_response(&mut stream, "503 Service Unavailable", "task queue is full")
+                    }
+                    Ok(WebhookEnqueue::Duplicate) => write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "run enqueue failed",
+                    ),
+                    Err(error) => {
+                        eprintln!("manual run enqueue failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "run enqueue failed",
+                        );
+                    }
+                }
+            }
+            ("POST", task_path) if cancel_task_id_path(task_path).is_some() => {
+                let task_id = cancel_task_id_path(task_path).expect("checked task id path");
+                let item = config_store
+                    .read()
+                    .expect("webhook config lock poisoned")
+                    .iter()
+                    .find(|item| item.task_id == task_id)
+                    .map(|item| item.item.clone());
+                let Some(item) = item else {
+                    write_response(&mut stream, "404 Not Found", "unknown task");
+                    return;
+                };
+                let cancelled =
+                    match state::cancel_webhook_events(Path::new(&item.workspace), &item.source) {
+                        Ok(cancelled) => cancelled,
+                        Err(error) => {
+                            eprintln!("task cancellation failed: {error}");
+                            write_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                "cancellation failed",
+                            );
+                            return;
+                        }
+                    };
+                git::cancel_workspace(Path::new(&item.workspace));
+                let body = format!(
+                    r#"{{"task_id":{task_id},"status":"cancellation_requested","events":{cancelled}}}"#
+                );
                 write_response_with_type(
                     &mut stream,
                     "202 Accepted",
                     "application/json; charset=utf-8",
                     &body,
                 );
+            }
+            ("POST", task_path) if retry_event_task_path(task_path).is_some() => {
+                let (task_id, event_id) =
+                    retry_event_task_path(task_path).expect("checked event retry path");
+                let item = config_store
+                    .read()
+                    .expect("webhook config lock poisoned")
+                    .iter()
+                    .find(|item| item.task_id == task_id)
+                    .map(|item| item.item.clone());
+                let Some(item) = item else {
+                    write_response(&mut stream, "404 Not Found", "unknown task");
+                    return;
+                };
+                match state::retry_webhook_event(Path::new(&item.workspace), &item.source, event_id)
+                {
+                    Ok(true) => {
+                        let _ = wake_sender.send(WorkerCommand::Webhook(task_id));
+                        let body = format!(
+                            r#"{{"task_id":{task_id},"event_id":{event_id},"status":"queued"}}"#
+                        );
+                        write_response_with_type(
+                            &mut stream,
+                            "202 Accepted",
+                            "application/json; charset=utf-8",
+                            &body,
+                        );
+                    }
+                    Ok(false) => {
+                        write_response(&mut stream, "404 Not Found", "event not retryable")
+                    }
+                    Err(error) => {
+                        eprintln!("event retry failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "event retry failed",
+                        );
+                    }
+                }
             }
             ("PUT", task_path) => {
                 let Some(task_id) = task_id_path(task_path) else {

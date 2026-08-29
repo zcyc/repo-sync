@@ -115,8 +115,12 @@ sync results; protect it at the reverse proxy if it is not on a private network.
 The listener caps active connections at 64 and returns `503` when saturated.
 Login failures are limited per client address: five failures in one minute
 temporarily block further login attempts for five minutes. The worker reacts
-to matching Webhook deliveries and manual runs immediately instead of scanning
-every task on a fixed polling interval.
+to matching Webhook deliveries, manual runs, and scheduled runs immediately
+instead of scanning every task on a fixed polling interval. Webhook, manual,
+and cron triggers are persisted in the same SQLite event queue, so a process
+restart does not silently drop a requested run. The page can cancel
+queued or running work; a running Git command is stopped cooperatively and is
+not retried as a normal failure.
 For systemd, start from `repo-sync.service.example` and
 `webhook.env.example`; the example keeps the task database in
 `/var/lib/repo-sync` and the secrets in `/etc/repo-sync`. `systemctl reload
@@ -125,10 +129,11 @@ repo-sync` reloads the task database.
 The embedded administration page is available at `/`. On first use, set the
 administrator username and a 12-256 character password; later visits use the
 account/password login and an HttpOnly session cookie. The page can view each
-task's latest run, target status, Webhook queue, and recent events, and can edit
-tasks directly in SQLite. Passwords are stored as Argon2id hashes and session
-tokens are stored only as hashes. Keep the listener on a private address or
-put it behind a TLS reverse proxy.
+task's latest and recent runs, target status, Webhook queue, and recent events;
+it can filter tasks, run or cancel work, retry failed events, and edit tasks
+directly in SQLite. Passwords are stored as Argon2id hashes and session tokens
+are stored only as hashes. Keep the listener on a private address or put it
+behind a TLS reverse proxy.
 
 ## systemd（Linux 可选）
 
@@ -166,6 +171,28 @@ automatically. If the administrator password is lost, stop the listener and
 run `repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --reset-admin`;
 the next visit to `/` will require setting a new account and password. This
 clears only the administrator account and sessions, not tasks or workspaces.
+
+`prometheus-alerts.example.yml` contains starter rules for queue stalls, sync
+failures, dead-letter events, and login abuse. Load it into Prometheus and use
+Alertmanager for notification routing and deduplication.
+
+For Linux, the optional `repo-sync-backup.sh.example`,
+`repo-sync-backup.service.example`, and `repo-sync-backup.timer.example` run a
+daily task-database snapshot with a unique UTC filename. Install the script as
+`/usr/local/libexec/repo-sync-backup`, install both unit files under
+`/etc/systemd/system`, then run:
+
+```sh
+sudo install -d -m 755 /usr/local/libexec
+sudo install -d -o repo-sync -g repo-sync -m 700 /var/lib/repo-sync/backups
+sudo install -m 700 repo-sync-backup.sh.example /usr/local/libexec/repo-sync-backup
+sudo install -m 644 repo-sync-backup.service.example repo-sync-backup.timer.example /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now repo-sync-backup.timer
+```
+
+The template does not delete old backups; apply the retention policy used by
+your host separately.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one

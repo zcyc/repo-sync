@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+database=/var/lib/repo-sync/repo-sync.sqlite3
+backup_dir=/var/lib/repo-sync/backups
+
+mkdir -p "$backup_dir"
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+exec /usr/local/bin/repo-sync \
+  --database "$database" \
+  --backup-tasks "$backup_dir/tasks-$timestamp.sqlite3"

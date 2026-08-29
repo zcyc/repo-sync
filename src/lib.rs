@@ -8,8 +8,9 @@ mod webhook;
 
 pub use config::{validate, validate_item, DivergencePolicy, Item, SyncMode, TagPolicy};
 pub use state::{
-    backup_state, check_state, cooldown_active, prune_history, retry_webhook_event,
-    status as status_report, webhook_events, StatusReport, WebhookEventStatus, WebhookRefChange,
+    backup_state, cancel_webhook_events, check_state, cooldown_active, prune_history,
+    retry_webhook_event, status as status_report, webhook_events, StatusReport, WebhookEventStatus,
+    WebhookRefChange,
 };
 pub use sync::{check, sync};
 pub use tasks::{

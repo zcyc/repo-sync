@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily repo-sync task database backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=repo-sync-backup.service
+
+[Install]
+WantedBy=timers.target

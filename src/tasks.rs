@@ -453,6 +453,7 @@ pub fn backup_task_database(path: &Path, destination: &Path) -> Result<(), Box<d
     let db = TaskDb::open(path)?;
     db.connection
         .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    check_task_database(destination)?;
     Ok(())
 }
 
