@@ -26,7 +26,10 @@ struct Args {
     #[clap(short, long, help = "TOML config file path")]
     file: Option<String>,
 
-    #[clap(long, help = "local repository workspace")]
+    #[clap(
+        long,
+        help = "local repository workspace; selects --retry-event when used with --file"
+    )]
     workspace: Option<String>,
 
     #[clap(long, value_enum, help = "sync mode: branch or mirror")]
@@ -145,6 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         retry_event,
         once,
     } = Args::parse();
+    let retry_workspace = workspace.clone();
     let webhook_secret = webhook_secret.or_else(|| std::env::var("REPO_SYNC_WEBHOOK_SECRET").ok());
 
     if check_only && once {
@@ -214,7 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }]
         }
         (None, None, Some(file))
-            if workspace.is_none()
+            if (workspace.is_none() || retry_event.is_some())
                 && mode.is_none()
                 && crontab.is_none()
                 && branches.is_none()
@@ -322,7 +326,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if let Some(event_id) = retry_event {
-        if retry_webhook(&config, event_id)? {
+        if retry_webhook(&config, event_id, retry_workspace.as_deref())? {
             println!("webhook event {event_id} retried");
             return Ok(());
         }

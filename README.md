@@ -156,14 +156,19 @@ syncs. GitHub uses `X-Hub-Signature-256`; GitLab signing tokens and legacy secre
 tokens are accepted. `/healthz` and `/readyz` are available without provider
 headers. The listener returns `202` after SQLite enqueue and a background worker
 performs the sync, so provider retries do not block on Git. Put it behind an
-existing TLS reverse proxy and stop it with Ctrl-C.
+existing TLS reverse proxy and stop it with Ctrl-C. `/metrics` exposes Prometheus
+text metrics for request outcomes, queue status, deduplication, coalescing, and
+sync results; protect it at the reverse proxy if it is not on a private network.
+The listener caps active connections at 64 and returns `503` when saturated.
 
 `--events` shows the latest 50 webhook events per configured workspace;
 `--events --json` is suitable for monitoring. `--retry-event <ID>` resets a
 failed/dead event and executes it immediately. Event retries use the existing
 `max_retries` and `retry_backoff_secs` settings; exhausted events remain in the
 dead-letter state until manually retried. When several deliveries are waiting,
-one successful full-state sync coalesces the redundant queued deliveries.
+one successful full-state sync coalesces the redundant queued deliveries. Event
+IDs are local to each workspace; pass `--workspace <PATH>` with
+`--retry-event <ID>` when the ID exists in more than one workspace.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one

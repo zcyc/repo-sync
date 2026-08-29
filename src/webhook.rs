@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc,
     },
@@ -25,6 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ACTIVE_CONNECTIONS: u64 = 64;
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 const EVENT_RECOVERY_MS: i64 = 10 * 60 * 1000;
 
@@ -50,6 +51,117 @@ struct RequestError {
     message: &'static str,
 }
 
+#[derive(Default)]
+struct Metrics {
+    active_connections: AtomicU64,
+    http_requests: AtomicU64,
+    rejected_requests: AtomicU64,
+    ignored_events: AtomicU64,
+    enqueued_events: AtomicU64,
+    deduplicated_events: AtomicU64,
+    coalesced_events: AtomicU64,
+    successful_syncs: AtomicU64,
+    failed_syncs: AtomicU64,
+    collection_errors: AtomicU64,
+}
+
+impl Metrics {
+    fn render(&self, config: &[Item]) -> String {
+        let mut output = String::new();
+        output.push_str("# HELP repo_sync_webhook_active_connections Current webhook connections.\n# TYPE repo_sync_webhook_active_connections gauge\n");
+        output.push_str(&format!(
+            "repo_sync_webhook_active_connections {}\n",
+            self.active_connections.load(Ordering::Relaxed)
+        ));
+        counter(
+            &mut output,
+            "repo_sync_http_requests_total",
+            "HTTP requests received",
+            self.http_requests.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_rejected_total",
+            "Webhook requests rejected",
+            self.rejected_requests.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_ignored_total",
+            "Webhook events ignored",
+            self.ignored_events.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_events_enqueued_total",
+            "Webhook events enqueued",
+            self.enqueued_events.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_events_deduplicated_total",
+            "Webhook deliveries deduplicated",
+            self.deduplicated_events.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_events_coalesced_total",
+            "Webhook events coalesced after a successful sync",
+            self.coalesced_events.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_sync_runs_succeeded_total",
+            "Successful sync runs",
+            self.successful_syncs.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_sync_runs_failed_total",
+            "Failed sync runs",
+            self.failed_syncs.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_metrics_collection_errors_total",
+            "Metrics collection errors",
+            self.collection_errors.load(Ordering::Relaxed),
+        );
+        output.push_str("# HELP repo_sync_webhook_events Current webhook events by workspace and status.\n# TYPE repo_sync_webhook_events gauge\n");
+        for item in config {
+            match state::webhook_queue_counts(std::path::Path::new(&item.workspace), &item.source) {
+                Ok(counts) => {
+                    for (status, count) in counts {
+                        output.push_str(&format!(
+                            "repo_sync_webhook_events{{workspace=\"{}\",status=\"{}\"}} {count}\n",
+                            escape_label(&item.workspace),
+                            escape_label(&status)
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.collection_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("metrics collection failed for {}: {error}", item.workspace);
+                }
+            }
+        }
+        output
+    }
+}
+
+fn counter(output: &mut String, name: &str, help: &str, value: u64) {
+    output.push_str(&format!(
+        "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n"
+    ));
+}
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn Error>> {
     for item in &config {
         config::validate_item(item)?;
@@ -61,11 +173,20 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
     listener.set_nonblocking(true)?;
     let config = Arc::new(config);
     let secret = Arc::new(secret.to_owned());
+    let metrics = Arc::new(Metrics::default());
     let (wake_sender, wake_receiver) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_config = Arc::clone(&config);
-    let worker = thread::spawn(move || worker_loop(worker_config, wake_receiver, worker_shutdown));
+    let worker_metrics = Arc::clone(&metrics);
+    let worker = thread::spawn(move || {
+        worker_loop(
+            worker_config,
+            wake_receiver,
+            worker_shutdown,
+            worker_metrics,
+        )
+    });
     let shutdown_handler = Arc::clone(&shutdown);
     ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Relaxed))?;
 
@@ -73,10 +194,27 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if metrics.active_connections.fetch_add(1, Ordering::Relaxed)
+                    >= MAX_ACTIVE_CONNECTIONS
+                {
+                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    write_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "too many connections",
+                    );
+                    continue;
+                }
                 let config = Arc::clone(&config);
                 let secret = Arc::clone(&secret);
+                let metrics = Arc::clone(&metrics);
                 let wake_sender = wake_sender.clone();
-                thread::spawn(move || handle_connection(stream, &secret, &config, &wake_sender));
+                thread::spawn(move || {
+                    handle_connection(stream, &secret, &config, &wake_sender, &metrics);
+                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
@@ -90,21 +228,45 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
     Ok(())
 }
 
-pub fn retry_event(config: &[Item], event_id: i64) -> Result<bool, Box<dyn Error>> {
+pub fn retry_event(
+    config: &[Item],
+    event_id: i64,
+    selected_workspace: Option<&str>,
+) -> Result<bool, Box<dyn Error>> {
+    let mut candidate = None;
     for item in config {
-        let workspace = std::path::Path::new(&item.workspace);
-        if state::retry_webhook_event(workspace, &item.source, event_id)? {
-            process_item(item, Some(event_id))?;
-            return Ok(true);
+        if selected_workspace.is_some_and(|workspace| workspace != item.workspace) {
+            continue;
         }
+        let workspace = std::path::Path::new(&item.workspace);
+        if !state::has_retryable_webhook_event(workspace, &item.source, event_id)? {
+            continue;
+        }
+        if candidate.is_some() {
+            return Err("webhook event id is ambiguous; pass --workspace".into());
+        }
+        candidate = Some(item);
+    }
+    let Some(item) = candidate else {
+        return Ok(false);
+    };
+    let workspace = std::path::Path::new(&item.workspace);
+    if state::retry_webhook_event(workspace, &item.source, event_id)? {
+        process_item(item, Some(event_id), None)?;
+        return Ok(true);
     }
     Ok(false)
 }
 
-fn worker_loop(config: Arc<Vec<Item>>, wake_receiver: Receiver<()>, shutdown: Arc<AtomicBool>) {
+fn worker_loop(
+    config: Arc<Vec<Item>>,
+    wake_receiver: Receiver<()>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
+) {
     while !shutdown.load(Ordering::Relaxed) {
         for item in config.iter() {
-            if let Err(error) = process_item(item, None) {
+            if let Err(error) = process_item(item, None, Some(&metrics)) {
                 eprintln!("webhook worker failed for {}: {error}", item.workspace);
             }
         }
@@ -115,7 +277,11 @@ fn worker_loop(config: Arc<Vec<Item>>, wake_receiver: Receiver<()>, shutdown: Ar
     }
 }
 
-fn process_item(item: &Item, event_id: Option<i64>) -> Result<(), Box<dyn Error>> {
+fn process_item(
+    item: &Item,
+    event_id: Option<i64>,
+    metrics: Option<&Metrics>,
+) -> Result<(), Box<dyn Error>> {
     let workspace = std::path::Path::new(&item.workspace);
     let mut db = StateDb::open(workspace, &item.source)?;
     loop {
@@ -141,7 +307,20 @@ fn process_item(item: &Item, event_id: Option<i64>) -> Result<(), Box<dyn Error>
         )?;
         if result.is_ok() {
             // ponytail: a successful full-state sync makes queued notifications redundant.
-            db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
+            let coalesced =
+                db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
+            if let Some(metrics) = metrics {
+                metrics
+                    .coalesced_events
+                    .fetch_add(coalesced as u64, Ordering::Relaxed);
+            }
+        }
+        if let Some(metrics) = metrics {
+            if result.is_ok() {
+                metrics.successful_syncs.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.failed_syncs.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if event_id.is_some() {
             return result;
@@ -165,10 +344,13 @@ fn handle_connection(
     secret: &str,
     config: &[Item],
     wake_sender: &Sender<()>,
+    metrics: &Metrics,
 ) {
+    metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
+            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(&mut stream, "400 Bad Request", error);
             return;
         }
@@ -182,18 +364,30 @@ fn handle_connection(
         write_response(&mut stream, "200 OK", "ready");
         return;
     }
+    if request.method == "GET" && path == "/metrics" {
+        write_response_with_type(
+            &mut stream,
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &metrics.render(config),
+        );
+        return;
+    }
     if request.method != "POST" {
+        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "405 Method Not Allowed", "POST required");
         return;
     }
     let event = match parse_event(&request.headers, &request.body, secret) {
         Ok(event) => event,
         Err(error) => {
+            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(&mut stream, error.status, error.message);
             return;
         }
     };
     let Some(event) = event else {
+        metrics.ignored_events.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "202 Accepted", "event ignored");
         return;
     };
@@ -228,9 +422,12 @@ fn handle_connection(
             state::now_ms(),
         ) {
             Ok(true) => {
+                metrics.enqueued_events.fetch_add(1, Ordering::Relaxed);
                 let _ = wake_sender.send(());
             }
-            Ok(false) => {}
+            Ok(false) => {
+                metrics.deduplicated_events.fetch_add(1, Ordering::Relaxed);
+            }
             Err(error) => {
                 eprintln!("webhook event enqueue failed: {error}");
                 write_response(&mut stream, "500 Internal Server Error", "event failed");
@@ -241,6 +438,7 @@ fn handle_connection(
     if matched {
         write_response(&mut stream, "202 Accepted", "sync queued");
     } else {
+        metrics.ignored_events.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "202 Accepted", "event ignored");
     }
 }
@@ -655,8 +853,12 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
+    write_response_with_type(stream, status, "text/plain; charset=utf-8", body);
+}
+
+fn write_response_with_type(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -664,11 +866,11 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_event, verify_github_signature};
+    use super::{escape_label, parse_event, verify_github_signature, Metrics};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::atomic::Ordering};
 
     type HmacSha256 = Hmac<Sha256>;
 
@@ -778,6 +980,16 @@ mod tests {
             ("x-hub-signature-256".into(), "sha256=00".into()),
         ]);
         assert!(!verify_github_signature(&headers, body, "secret"));
+    }
+
+    #[test]
+    fn renders_prometheus_metrics_and_escapes_labels() {
+        let metrics = Metrics::default();
+        metrics.http_requests.fetch_add(3, Ordering::Relaxed);
+        let output = metrics.render(&[]);
+        assert!(output.contains("# TYPE repo_sync_http_requests_total counter"));
+        assert!(output.contains("repo_sync_http_requests_total 3"));
+        assert_eq!(escape_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
     }
 
     #[test]

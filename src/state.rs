@@ -426,6 +426,22 @@ impl StateDb {
         Ok(changed == 1)
     }
 
+    pub(crate) fn has_retryable_webhook_event(
+        &self,
+        source: &str,
+        event_id: i64,
+    ) -> rusqlite::Result<bool> {
+        let exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM webhook_events
+                 WHERE source = ?1 AND event_id = ?2 AND status IN ('failed', 'dead')
+             )",
+            params![source, event_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     pub(crate) fn coalesce_webhook_events(
         &self,
         source: &str,
@@ -633,6 +649,36 @@ pub fn webhook_events(
     Ok(events)
 }
 
+pub(crate) fn webhook_queue_counts(
+    workspace: &Path,
+    source: &str,
+) -> Result<BTreeMap<String, i64>, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let stored_source: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored_source.as_deref() != Some(source) {
+        return Err("state database source does not match configuration source".into());
+    }
+    let mut statement = connection.prepare(
+        "SELECT status, COUNT(*) FROM webhook_events
+         WHERE source = ?1 GROUP BY status ORDER BY status",
+    )?;
+    let counts = statement
+        .query_map([source], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<String, i64>>>()?;
+    Ok(counts)
+}
+
 pub fn retry_webhook_event(
     workspace: &Path,
     source: &str,
@@ -644,6 +690,19 @@ pub fn retry_webhook_event(
     }
     let db = StateDb::open(workspace, source)?;
     Ok(db.retry_webhook_event(source, event_id)?)
+}
+
+pub(crate) fn has_retryable_webhook_event(
+    workspace: &Path,
+    source: &str,
+    event_id: i64,
+) -> Result<bool, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let db = StateDb::open(workspace, source)?;
+    Ok(db.has_retryable_webhook_event(source, event_id)?)
 }
 
 pub fn cooldown_active(
@@ -758,6 +817,9 @@ mod tests {
             now + 1,
         )
         .unwrap();
+        assert!(db
+            .has_retryable_webhook_event(source, claimed.event_id)
+            .unwrap());
         assert!(db.retry_webhook_event(source, claimed.event_id).unwrap());
         let retry_now = super::now_ms();
         let claimed = db
