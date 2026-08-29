@@ -729,6 +729,10 @@ fn record_sync_metrics(metrics: &Metrics, started: Instant, result: &Result<(), 
     };
 }
 
+fn should_coalesce_webhook_events(finished: bool, result_ok: bool, dry_run: bool) -> bool {
+    finished && result_ok && !dry_run
+}
+
 fn process_item(
     item: &Item,
     event_id: Option<i64>,
@@ -801,8 +805,8 @@ fn process_item(
             state::now_ms(),
             retry_after,
         )?;
-        if finished && result.is_ok() {
-            // ponytail: a successful full-state sync makes queued notifications redundant.
+        if should_coalesce_webhook_events(finished, result.is_ok(), item.dry_run) {
+            // A successful non-dry-run full-state sync makes queued notifications redundant.
             let coalesced =
                 db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
             if let Some(metrics) = metrics {
@@ -1974,8 +1978,8 @@ fn write_response_with_cookie_and_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_label, parse_event, verify_event, verify_github_signature, verify_gitlab_signature,
-        LoginLimiter, Metrics,
+        escape_label, parse_event, should_coalesce_webhook_events, verify_event,
+        verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
     };
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1995,6 +1999,13 @@ mod tests {
     };
 
     type HmacSha256 = Hmac<Sha256>;
+
+    #[test]
+    fn dry_run_does_not_coalesce_webhook_events() {
+        assert!(!should_coalesce_webhook_events(true, true, true));
+        assert!(should_coalesce_webhook_events(true, true, false));
+        assert!(!should_coalesce_webhook_events(false, true, false));
+    }
 
     #[test]
     fn limits_repeated_login_failures_per_address() {

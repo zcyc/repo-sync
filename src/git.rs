@@ -1,11 +1,13 @@
 use crate::config;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{mpsc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -169,6 +171,8 @@ pub(crate) fn same_repository(actual: &str, expected: &str) -> bool {
 
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -181,27 +185,40 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus>
     let started = Instant::now();
     loop {
         if cancellation_requested() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_group(child);
             return Err(io::Error::new(io::ErrorKind::Interrupted, "sync cancelled"));
         }
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
         if started.elapsed() >= timeout {
-            // ponytail: kill only covers git; use process groups if descendants leak.
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_group(child);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("git command timed out after {}s", timeout.as_secs()),
             ));
         }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
         thread::sleep(Duration::from_millis(100));
     }
 }
 
+fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args(["-KILL", process_group.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn output_once(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<Output> {
+    let started = Instant::now();
     let mut command = command(dir, args);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
@@ -213,27 +230,53 @@ fn output_once(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<Outpu
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("git stderr was not piped"))?;
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
     let stdout_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = stdout_sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
     });
+    let (stderr_sender, stderr_receiver) = mpsc::channel();
     let stderr_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = stderr_sender.send(stderr.read_to_end(&mut bytes).map(|_| bytes));
     });
     let status = wait_for_exit(&mut child, timeout);
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| io::Error::other("git stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("git stderr reader panicked"))??;
     let status = status?;
+    let stdout = receive_output(stdout_receiver, &mut child, started, timeout)?;
+    let stderr = receive_output(stderr_receiver, &mut child, started, timeout)?;
+    stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("git stdout reader panicked"))?;
+    stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("git stderr reader panicked"))?;
     Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+fn receive_output(
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    child: &mut Child,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
+    match receiver.recv_timeout(remaining) {
+        Ok(output) => output,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill_process_group(child);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("git command timed out after {}s", timeout.as_secs()),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("git output reader stopped unexpectedly"))
+        }
+    }
 }
 
 fn command_error(args: &[&str], output: &Output) -> String {
@@ -341,8 +384,14 @@ fn redact(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancel_workspace, cancellation_requested, CancellationScope};
-    use std::path::Path;
+    use super::{cancel_workspace, cancellation_requested, output, CancellationScope, RetryPolicy};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        process::Command,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn cancellation_is_scoped_to_the_active_workspace() {
@@ -355,5 +404,55 @@ mod tests {
         }
         let _scope = CancellationScope::enter(workspace);
         assert!(!cancellation_requested());
+    }
+
+    #[test]
+    fn output_timeout_does_not_wait_for_descendant_pipes() {
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-git-timeout-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let result = output(
+            &root,
+            &[
+                "-c",
+                "user.name=repo-sync-test",
+                "-c",
+                "user.email=repo-sync-test@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "test",
+            ],
+            Duration::from_secs(1),
+            RetryPolicy {
+                max_retries: 0,
+                backoff_secs: 0,
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut));
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "git output waited {elapsed:?} past its timeout"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

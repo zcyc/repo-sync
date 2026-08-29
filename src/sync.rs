@@ -545,7 +545,7 @@ fn sync_target(
                 verify_target(repo_dir, remote, &plan, timeout, retry)?;
             }
             Ok(TargetOutcome {
-                pushed: true,
+                pushed: !item.dry_run,
                 skipped_branches: plan.skipped_branches,
                 skipped_tags: plan.skipped_tags,
                 synced_refs: plan.synced_refs,
@@ -570,7 +570,7 @@ fn sync_target(
                 verify_target(repo_dir, remote, &plan, timeout, retry)?;
             }
             Ok(TargetOutcome {
-                pushed: true,
+                pushed: !item.dry_run,
                 skipped_branches: 0,
                 skipped_tags: 0,
                 synced_refs: plan.synced_refs,

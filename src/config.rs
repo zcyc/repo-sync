@@ -123,6 +123,9 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     {
         return Err("workspace must be a non-current directory".into());
     }
+    if workspace_identity(workspace)? == std::env::current_dir()?.canonicalize()? {
+        return Err("workspace must be a non-current directory".into());
+    }
     if item.timeout_secs == 0 {
         return Err("timeout_secs must be greater than zero".into());
     }
@@ -173,7 +176,8 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     let destructive = matches!(item.mode, SyncMode::Mirror)
         || item.prune_branches
         || item.prune_tags
-        || item.tag_policy == TagPolicy::Force;
+        || item.tag_policy == TagPolicy::Force
+        || item.divergence == DivergencePolicy::Force;
     if !item.dry_run && destructive && !item.allow_destructive {
         return Err("destructive sync requires allow_destructive=true".into());
     }
@@ -250,7 +254,8 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_selected, ref_selected, validate, DivergencePolicy, Item, SyncMode, TagPolicy,
+        branch_selected, ref_selected, validate, validate_item, DivergencePolicy, Item, SyncMode,
+        TagPolicy,
     };
     #[cfg(unix)]
     use std::{
@@ -306,6 +311,26 @@ mod tests {
         let mut config = item();
         config.source = "https://user:secret@example.com/repo.git".into();
         assert!(validate(&[config]).is_err());
+    }
+
+    #[test]
+    fn requires_permission_for_forced_branch_updates() {
+        let mut config = item();
+        config.divergence = DivergencePolicy::Force;
+        assert!(validate_item(&config).is_err());
+
+        config.allow_destructive = true;
+        assert!(validate_item(&config).is_ok());
+    }
+
+    #[test]
+    fn rejects_absolute_current_directory_workspace() {
+        let mut config = item();
+        config.workspace = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(validate_item(&config).is_err());
     }
 
     #[cfg(unix)]

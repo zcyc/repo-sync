@@ -168,11 +168,13 @@ pub(crate) struct WebhookEventInput<'a> {
 impl StateDb {
     pub(crate) fn open(workspace: &Path, source: &str) -> Result<Self, Box<dyn Error>> {
         let path = database_path(workspace)?;
-        let connection = Connection::open(&path)?;
+        let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        configure(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let user_version: i64 =
-            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let has_user_schema: bool = connection.query_row(
+            transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let has_user_schema: bool = transaction.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sqlite_master
                  WHERE type IN ('table', 'index', 'view', 'trigger')
@@ -192,12 +194,15 @@ impl StateDb {
             )
             .into());
         }
-        configure(&connection)?;
-        connection.execute_batch(SCHEMA)?;
+        transaction.execute_batch(SCHEMA)?;
         if user_version == 0 {
-            connection.execute_batch("PRAGMA user_version = 2;")?;
+            transaction.execute_batch("PRAGMA user_version = 2;")?;
         }
-        let stored_source: Option<String> = connection
+        transaction.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('source', ?1)",
+            [source],
+        )?;
+        let stored_source: Option<String> = transaction
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'source'",
                 [],
@@ -208,12 +213,8 @@ impl StateDb {
             if stored_source != source {
                 return Err("state database source does not match configuration source".into());
             }
-        } else {
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES ('source', ?1)",
-                [source],
-            )?;
         }
+        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -1095,7 +1096,11 @@ mod tests {
     use rusqlite::Connection;
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1199,6 +1204,45 @@ mod tests {
         let _ = fs::remove_file(&database);
         let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn concurrent_state_initialization_is_idempotent() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-state-race-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://example.test/source.git";
+        let barrier = Arc::new(Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let workspace = workspace.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    StateDb::open(&workspace, source)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
