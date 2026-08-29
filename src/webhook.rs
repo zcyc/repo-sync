@@ -572,13 +572,11 @@ fn repository_keys(value: &str) -> Vec<String> {
         let path = parts.next().unwrap_or_default();
         if !host.is_empty() && !path.is_empty() {
             keys.push(format!("{host}/{path}"));
-            keys.push(path.to_owned());
         }
     } else if let Some((user_host, path)) = value.split_once(':') {
         let host = user_host.rsplit('@').next().unwrap_or(user_host);
         if !host.is_empty() && !path.is_empty() {
             keys.push(format!("{host}/{path}"));
-            keys.push(path.to_owned());
         }
     } else {
         keys.push(value.trim_start_matches('/').to_owned());
@@ -780,5 +778,21 @@ mod tests {
             ("x-hub-signature-256".into(), "sha256=00".into()),
         ]);
         assert!(!verify_github_signature(&headers, body, "secret"));
+    }
+
+    #[test]
+    fn repository_matching_keeps_hosts_distinct() {
+        assert_eq!(
+            super::repository_keys("https://github.com/org/repo.git"),
+            vec!["github.com/org/repo"]
+        );
+        assert_eq!(
+            super::repository_keys("git@gitlab.com:org/repo.git"),
+            vec!["gitlab.com/org/repo"]
+        );
+        assert_ne!(
+            super::repository_keys("https://github.com/org/repo.git"),
+            super::repository_keys("https://gitlab.com/org/repo.git")
+        );
     }
 }
