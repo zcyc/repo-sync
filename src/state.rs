@@ -517,7 +517,7 @@ impl StateDb {
         error: Option<&str>,
         finished_ms: i64,
         retry_after_ms: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<bool> {
         let cancelled = error == Some("sync cancelled");
         let (status, next_attempt_ms) = if cancelled {
             ("cancelled", finished_ms)
@@ -528,13 +528,20 @@ impl StateDb {
         } else {
             ("failed", retry_after_ms)
         };
-        self.connection.execute(
+        let changed = self.connection.execute(
             "UPDATE webhook_events
              SET status = ?2, finished_ms = ?3, next_attempt_ms = ?4, last_error = ?5
-             WHERE event_id = ?1 AND status = 'running'",
-            params![event_id, status, finished_ms, next_attempt_ms, error],
+             WHERE event_id = ?1 AND status = 'running' AND attempts = ?6",
+            params![
+                event_id,
+                status,
+                finished_ms,
+                next_attempt_ms,
+                error,
+                attempts
+            ],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     pub(crate) fn webhook_event_is_running(&self, event_id: i64) -> rusqlite::Result<bool> {
@@ -1328,6 +1335,57 @@ mod tests {
         let _ = fs::remove_file(&database);
         let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn stale_webhook_lease_owner_cannot_finish_event() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-stale-lease-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://github.com/example/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(matches!(
+            enqueue(&mut db, source, "stale-lease", "[]", 1, 10),
+            WebhookEnqueue::Enqueued
+        ));
+
+        let now = super::now_ms();
+        let first = db
+            .claim_webhook_event(source, now, 1, None)
+            .unwrap()
+            .unwrap();
+        let second = db
+            .claim_webhook_event(source, now + 2, 1_000, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.event_id, second.event_id);
+        assert!(second.attempts > first.attempts);
+
+        db.finish_webhook_event(first.event_id, first.attempts, 1, None, now + 3, now + 3)
+            .unwrap();
+        let events = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(events[0].status, "running");
+        assert_eq!(events[0].attempts, second.attempts);
+
+        db.finish_webhook_event(second.event_id, second.attempts, 1, None, now + 4, now + 4)
+            .unwrap();
+        drop(db);
+        let events = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(events[0].status, "succeeded");
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

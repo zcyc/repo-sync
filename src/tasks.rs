@@ -140,6 +140,7 @@ impl TaskDb {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_workspace_is_unique(&transaction, &item.workspace, None)?;
         transaction.execute(
             "INSERT INTO tasks(enabled, source, workspace, config_json, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
@@ -170,8 +171,10 @@ impl TaskDb {
     ) -> Result<Option<Task>, Box<dyn Error>> {
         validate_item(item)?;
         let config_json = serde_json::to_string(item)?;
-        let created_ms: Option<i64> = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let created_ms: Option<i64> = transaction
             .query_row(
                 "SELECT created_ms FROM tasks WHERE task_id = ?1",
                 [id],
@@ -179,10 +182,12 @@ impl TaskDb {
             )
             .optional()?;
         let Some(created_ms) = created_ms else {
+            transaction.commit()?;
             return Ok(None);
         };
+        ensure_workspace_is_unique(&transaction, &item.workspace, Some(id))?;
         let updated_ms = now_ms();
-        let changed = self.connection.execute(
+        let changed = transaction.execute(
             "UPDATE tasks
              SET enabled = ?2, source = ?3, workspace = ?4, config_json = ?5, updated_ms = ?6
              WHERE task_id = ?1",
@@ -196,8 +201,10 @@ impl TaskDb {
             ],
         )?;
         if changed == 0 {
+            transaction.commit()?;
             return Ok(None);
         }
+        transaction.commit()?;
         Ok(Some(Task {
             id,
             enabled,
@@ -485,6 +492,30 @@ fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn ensure_workspace_is_unique(
+    connection: &rusqlite::Connection,
+    workspace: &str,
+    exclude_id: Option<i64>,
+) -> Result<(), Box<dyn Error>> {
+    let identity = config::workspace_identity(Path::new(workspace))?;
+    let mut statement = connection.prepare("SELECT task_id, workspace FROM tasks")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (task_id, stored_workspace) = row?;
+        if exclude_id == Some(task_id) {
+            continue;
+        }
+        if config::workspace_identity(Path::new(&stored_workspace))? == identity {
+            return Err(
+                format!("workspace resolves to an existing task workspace: {workspace}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_credentials(username: &str, password: &str) -> Result<(), Box<dyn Error>> {
     let username_length = username.chars().count();
     if !(1..=64).contains(&username_length) || username.chars().any(char::is_control) {
@@ -606,6 +637,43 @@ mod tests {
         assert!(!updated.enabled);
         assert!(db.delete(task.id).unwrap());
         assert!(db.list().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_database_rejects_workspace_aliases() {
+        let sequence = NEXT_TASK_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-task-alias-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let real_workspace = root.join("workspace");
+        let alias_workspace = root.join("workspace-alias");
+        fs::create_dir(&real_workspace).unwrap();
+        std::os::unix::fs::symlink(&real_workspace, &alias_workspace).unwrap();
+        let database = root.join("tasks.sqlite3");
+        let mut db = TaskDb::open(&database).unwrap();
+        db.create(&item(real_workspace.to_str().unwrap()), true)
+            .unwrap();
+        assert!(db
+            .create(&item(alias_workspace.to_str().unwrap()), true)
+            .is_err());
+
+        let second_workspace = root.join("second-workspace");
+        let second = db
+            .create(&item(second_workspace.to_str().unwrap()), true)
+            .unwrap();
+        assert!(db
+            .update(second.id, &item(alias_workspace.to_str().unwrap()), true)
+            .is_err());
+
+        drop(db);
         let _ = fs::remove_dir_all(root);
     }
 

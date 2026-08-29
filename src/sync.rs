@@ -432,7 +432,7 @@ fn sync_source(
     validate_workspace(repo_dir, item, timeout)?;
     git::run(
         repo_dir,
-        &["fetch", "--prune", "--tags", "origin"],
+        &["fetch", "--prune", "--prune-tags", "--tags", "origin"],
         timeout,
         retry,
     )

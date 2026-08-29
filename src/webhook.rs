@@ -759,7 +759,7 @@ fn process_item(
         }
         let retry_after =
             state::now_ms().saturating_add(event_retry_delay(item.retry_backoff_secs, attempts));
-        db.finish_webhook_event(
+        let finished = db.finish_webhook_event(
             claimed_id,
             attempts,
             i64::from(item.max_retries) + 1,
@@ -767,7 +767,7 @@ fn process_item(
             state::now_ms(),
             retry_after,
         )?;
-        if result.is_ok() {
+        if finished && result.is_ok() {
             // ponytail: a successful full-state sync makes queued notifications redundant.
             let coalesced =
                 db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;

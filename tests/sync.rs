@@ -120,7 +120,7 @@ fn setup_source(root: &Path) -> (PathBuf, PathBuf) {
 #[test]
 fn syncs_all_branches_and_tags_then_prunes_target_refs() {
     let temp = TempDir::new();
-    let (source, _) = setup_source(&temp.0);
+    let (source, source_work) = setup_source(&temp.0);
     let target = temp.0.join("target.git");
     let workspace = temp.0.join("workspace");
     git(&temp.0, &["init", "--bare", target.to_str().unwrap()]);
@@ -172,6 +172,8 @@ fn syncs_all_branches_and_tags_then_prunes_target_refs() {
     git(&target_work, &["commit", "-m", "stale"]);
     git(&target_work, &["tag", "stale-tag"]);
     git(&target_work, &["push", "origin", "stale", "stale-tag"]);
+    git(&source_work, &["tag", "-d", "v1"]);
+    git(&source_work, &["push", "origin", ":refs/tags/v1"]);
 
     let mut prune = item(&source, &target, &workspace);
     prune.allow_destructive = true;
@@ -188,6 +190,12 @@ fn syncs_all_branches_and_tags_then_prunes_target_refs() {
     assert!(!git_output(
         &target,
         &["show-ref", "--verify", "--quiet", "refs/tags/stale-tag"]
+    )
+    .status
+    .success());
+    assert!(!git_output(
+        &target,
+        &["show-ref", "--verify", "--quiet", "refs/tags/v1"]
     )
     .status
     .success());
