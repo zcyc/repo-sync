@@ -362,6 +362,21 @@ impl StateDb {
         transaction.commit()
     }
 
+    pub(crate) fn mark_dry_run(
+        &self,
+        source: &str,
+        target: &str,
+        duration_ms: i64,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE targets
+             SET status = 'dry-run', last_duration_ms = ?3
+             WHERE source = ?1 AND target = ?2",
+            params![source, target, duration_ms],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn mark_failure(
         &self,
         source: &str,
@@ -1246,6 +1261,46 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_does_not_reset_target_success_state() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-dry-run-state-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://example.test/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        db.mark_running(source, "target", super::now_ms()).unwrap();
+        let refs =
+            std::collections::BTreeMap::from([("refs/heads/main".to_owned(), "abc123".to_owned())]);
+        db.mark_success(source, "target", "synced", 1, &refs, true)
+            .unwrap();
+        db.mark_running(source, "target", super::now_ms()).unwrap();
+        db.mark_failure(source, "target", 1, "target unavailable")
+            .unwrap();
+        db.mark_running(source, "target", super::now_ms()).unwrap();
+        db.mark_dry_run(source, "target", 2).unwrap();
+        drop(db);
+
+        let target = &super::status(&workspace, source).unwrap().targets[0];
+        assert_eq!(target.status, "dry-run");
+        assert_eq!(target.consecutive_failures, 1);
+        assert!(target.last_success_ms.is_some());
+        assert_eq!(target.synced_refs, refs);
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn trigger_events_are_persistent_and_cancellable() {
         let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1471,7 +1526,7 @@ mod tests {
             .unwrap());
         assert!(db.retry_webhook_event(source, second.event_id).unwrap());
         let third = db
-            .claim_webhook_event(source, now + 5, 1_000, None)
+            .claim_webhook_event(source, super::now_ms() + 1_000, 1_000, None)
             .unwrap()
             .unwrap();
         assert_eq!(third.event_id, first.event_id);

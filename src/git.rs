@@ -1,6 +1,8 @@
 use crate::config;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::{io::AsRawHandle, process::CommandExt};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -136,7 +138,8 @@ pub(crate) fn output(
 }
 
 pub(crate) fn status(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<ExitStatus> {
-    let mut child = command(dir, args).spawn()?;
+    let mut command = command(dir, args);
+    let mut child = ManagedChild::spawn(&mut command)?;
     wait_for_exit(&mut child, timeout)
 }
 
@@ -173,6 +176,8 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(0x0000_0004);
     command
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -181,7 +186,149 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+struct ManagedChild {
+    child: Child,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl ManagedChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mut child = command.spawn()?;
+        #[cfg(not(windows))]
+        let child = command.spawn()?;
+        #[cfg(windows)]
+        {
+            let job = match WindowsJob::attach(&child) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = job.resume(&child) {
+                job.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            return Ok(Self { child, job });
+        }
+        #[cfg(not(windows))]
+        Ok(Self { child })
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach(child: &Child) -> io::Result<Self> {
+        use std::{mem::size_of, ptr::null};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        unsafe {
+            let handle = CreateJobObjectW(null(), null());
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let job = Self { handle };
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if AssignProcessToJobObject(job.handle, child.as_raw_handle()) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+    }
+
+    fn resume(&self, child: &Child) -> io::Result<()> {
+        use std::mem::size_of;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let result = (|| {
+                let mut entry = THREADENTRY32 {
+                    dwSize: size_of::<THREADENTRY32>() as u32,
+                    ..Default::default()
+                };
+                if Thread32First(snapshot, &mut entry) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                loop {
+                    if entry.th32OwnerProcessID == child.id() {
+                        let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                        if thread.is_null() {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let result = if ResumeThread(thread) == u32::MAX {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        };
+                        let _ = CloseHandle(thread);
+                        return result;
+                    }
+                    if Thread32Next(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+                Err(io::Error::other("git process main thread not found"))
+            })();
+            let _ = CloseHandle(snapshot);
+            result
+        }
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        unsafe {
+            let _ = TerminateJobObject(self.handle, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+fn wait_for_exit(child: &mut ManagedChild, timeout: Duration) -> io::Result<ExitStatus> {
     let started = Instant::now();
     loop {
         if cancellation_requested() {
@@ -195,17 +342,17 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus>
                 format!("git command timed out after {}s", timeout.as_secs()),
             ));
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child.try_wait()? {
             return Ok(status);
         }
         thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn kill_process_group(child: &mut Child) {
+fn kill_process_group(child: &mut ManagedChild) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
+        let process_group = format!("-{}", child.child.id());
         let _ = Command::new("kill")
             .args(["-KILL", process_group.as_str()])
             .stdin(Stdio::null())
@@ -213,20 +360,24 @@ fn kill_process_group(child: &mut Child) {
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(windows)]
+    child.job.terminate();
+    let _ = child.child.kill();
+    let _ = child.child.wait();
 }
 
 fn output_once(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<Output> {
     let started = Instant::now();
     let mut command = command(dir, args);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = ManagedChild::spawn(&mut command)?;
     let mut stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("git stdout was not piped"))?;
     let mut stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("git stderr was not piped"))?;
@@ -259,22 +410,30 @@ fn output_once(dir: &Path, args: &[&str], timeout: Duration) -> io::Result<Outpu
 
 fn receive_output(
     receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
-    child: &mut Child,
+    child: &mut ManagedChild,
     started: Instant,
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
-    let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
-    match receiver.recv_timeout(remaining) {
-        Ok(output) => output,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+    loop {
+        if cancellation_requested() {
             kill_process_group(child);
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("git command timed out after {}s", timeout.as_secs()),
-            ))
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "sync cancelled"));
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("git output reader stopped unexpectedly"))
+        let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
+        let wait = remaining.min(Duration::from_millis(100));
+        match receiver.recv_timeout(wait) {
+            Ok(output) => return output,
+            Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() >= timeout => {
+                kill_process_group(child);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("git command timed out after {}s", timeout.as_secs()),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("git output reader stopped unexpectedly"));
+            }
         }
     }
 }
@@ -384,12 +543,21 @@ fn redact(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancel_workspace, cancellation_requested, output, CancellationScope, RetryPolicy};
+    use super::{
+        cancel_workspace, cancellation_requested, receive_output, CancellationScope, ManagedChild,
+    };
+    #[cfg(unix)]
+    use super::{output, RetryPolicy};
+    use std::path::Path;
+    #[cfg(unix)]
     use std::{
         fs,
+        io::Read,
         os::unix::fs::PermissionsExt,
-        path::Path,
-        process::Command,
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -406,8 +574,8 @@ mod tests {
         assert!(!cancellation_requested());
     }
 
-    #[test]
-    fn output_timeout_does_not_wait_for_descendant_pipes() {
+    #[cfg(unix)]
+    fn repository_with_background_hook() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "repo-sync-git-timeout-test-{}-{}",
             std::process::id(),
@@ -424,8 +592,19 @@ mod tests {
             .unwrap()
             .success());
         let hook = root.join(".git/hooks/pre-commit");
-        fs::write(&hook, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
+        fs::write(
+            &hook,
+            "#!/bin/sh\npython3 -c 'import os,time; child=os.fork(); os._exit(0) if child else time.sleep(2)'\n",
+        )
+        .unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_timeout_does_not_wait_for_descendant_pipes() {
+        let root = repository_with_background_hook();
 
         let started = Instant::now();
         let result = output(
@@ -453,6 +632,39 @@ mod tests {
             "git output waited {elapsed:?} past its timeout"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_interrupts_descendant_pipe_wait() {
+        let root = repository_with_background_hook();
+        let mut command = Command::new("python3");
+        command
+            .process_group(0)
+            .args([
+                "-c",
+                "import os,time; child=os.fork(); os._exit(0) if child else time.sleep(2)",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ManagedChild::spawn(&mut command).unwrap();
+        let mut stdout = child.child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
+        });
+        let _scope = CancellationScope::enter(&root);
+        let cancel_root = root.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_workspace(&cancel_root);
+        });
+        let result = receive_output(receiver, &mut child, Instant::now(), Duration::from_secs(5));
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
+        let _ = reader.join();
         let _ = fs::remove_dir_all(root);
     }
 }

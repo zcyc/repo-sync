@@ -671,6 +671,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]

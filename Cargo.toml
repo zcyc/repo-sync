@@ -18,6 +18,15 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 signal-hook = "0.3.18"
 uuid = { version = "1.2.1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 lto = true
 strip = true

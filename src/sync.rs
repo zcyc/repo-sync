@@ -126,14 +126,22 @@ pub fn sync(item: &Item) -> Result<(), Box<dyn Error>> {
                 pushed_targets += usize::from(outcome.pushed);
                 skipped_branches += outcome.skipped_branches;
                 skipped_tags += outcome.skipped_tags;
-                state_db.mark_success(
-                    &item.source,
-                    target,
-                    if outcome.pushed { "synced" } else { "skipped" },
-                    target_started.elapsed().as_millis() as i64,
-                    &outcome.synced_refs,
-                    outcome.pushed,
-                )?;
+                if item.dry_run {
+                    state_db.mark_dry_run(
+                        &item.source,
+                        target,
+                        target_started.elapsed().as_millis() as i64,
+                    )?;
+                } else {
+                    state_db.mark_success(
+                        &item.source,
+                        target,
+                        if outcome.pushed { "synced" } else { "skipped" },
+                        target_started.elapsed().as_millis() as i64,
+                        &outcome.synced_refs,
+                        outcome.pushed,
+                    )?;
+                }
                 eprintln!(
                     "[{run_id}] {remote} complete: pushed={}, skipped_branches={}, skipped_tags={}, elapsed_ms={}",
                     outcome.pushed,
