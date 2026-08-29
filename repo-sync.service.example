@@ -1,0 +1,23 @@
+[Unit]
+Description=repo-sync webhook listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=repo-sync
+Group=repo-sync
+WorkingDirectory=/var/lib/repo-sync
+ExecStart=/usr/local/bin/repo-sync --serve 127.0.0.1:8080 --file /etc/repo-sync/config.toml
+EnvironmentFile=/etc/repo-sync/webhook.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/repo-sync
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

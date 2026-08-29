@@ -110,6 +110,20 @@ struct Args {
     #[clap(long, help = "retry a dead or failed webhook event by event id")]
     retry_event: Option<i64>,
 
+    #[clap(
+        long,
+        value_name = "DAYS",
+        help = "delete finished SQLite history older than DAYS"
+    )]
+    prune_history_days: Option<u64>,
+
+    #[clap(
+        long,
+        value_name = "PATH",
+        help = "backup one workspace SQLite database"
+    )]
+    backup_state: Option<String>,
+
     #[clap(long, help = "run scheduled items once and exit")]
     once: bool,
 }
@@ -146,10 +160,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         webhook_secret,
         events,
         retry_event,
+        prune_history_days,
+        backup_state,
         once,
     } = Args::parse();
     let retry_workspace = workspace.clone();
-    let webhook_secret = webhook_secret.or_else(|| std::env::var("REPO_SYNC_WEBHOOK_SECRET").ok());
+    let config_file = file.clone();
 
     if check_only && once {
         return Err("--check and --once cannot be used together".into());
@@ -171,8 +187,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     if retry_event.is_some() && (check_only || status_only || once || serve_addr.is_some()) {
         return Err("--retry-event cannot be combined with another control command".into());
     }
-    if serve_addr.is_some() && webhook_secret.is_none() {
-        return Err("--serve requires --webhook-secret or REPO_SYNC_WEBHOOK_SECRET".into());
+    if prune_history_days == Some(0) {
+        return Err("--prune-history-days must be greater than zero".into());
+    }
+    if prune_history_days.is_some()
+        && (check_only
+            || status_only
+            || once
+            || serve_addr.is_some()
+            || retry_event.is_some()
+            || events)
+    {
+        return Err("--prune-history-days cannot be combined with another control command".into());
+    }
+    if backup_state.is_some()
+        && (check_only
+            || status_only
+            || once
+            || serve_addr.is_some()
+            || retry_event.is_some()
+            || events
+            || prune_history_days.is_some())
+    {
+        return Err("--backup-state cannot be combined with another control command".into());
+    }
+    if serve_addr.is_some() && config_file.is_none() && webhook_secret.is_none() {
+        return Err("direct --serve requires --webhook-secret".into());
+    }
+    if serve_addr.is_some() && config_file.is_some() && webhook_secret.is_some() {
+        return Err(
+            "--webhook-secret cannot be used with --file; configure webhook_secret_envs".into(),
+        );
     }
     if serve_addr.is_none() && webhook_secret.is_some() {
         return Err("--webhook-secret requires --serve".into());
@@ -215,6 +260,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 retry_backoff_secs: retry_backoff_secs.ok_or("--retry-backoff-secs is required")?,
                 failure_cooldown_secs: failure_cooldown_secs
                     .ok_or("--failure-cooldown-secs is required")?,
+                webhook_secret_envs: Vec::new(),
             }]
         }
         (None, None, Some(file))
@@ -254,6 +300,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         for item in &config {
             check(item, check_write)?;
         }
+        return Ok(());
+    }
+    if let Some(days) = prune_history_days {
+        if config.len() != 1 {
+            return Err("--prune-history-days requires exactly one sync item".into());
+        }
+        let item = &config[0];
+        let deleted = repo_sync::prune_history(Path::new(&item.workspace), &item.source, days)?;
+        println!("pruned {deleted} SQLite history rows");
+        return Ok(());
+    }
+    if let Some(destination) = backup_state {
+        if config.len() != 1 {
+            return Err("--backup-state requires exactly one sync item".into());
+        }
+        let item = &config[0];
+        repo_sync::backup_state(
+            Path::new(&item.workspace),
+            &item.source,
+            Path::new(&destination),
+        )?;
+        println!("SQLite state backed up to {destination}");
         return Ok(());
     }
     if status_only {
@@ -336,7 +404,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_once(config);
     }
     if let Some(addr) = serve_addr {
-        return serve_webhook(&addr, webhook_secret.as_deref().unwrap(), config);
+        return serve_webhook(
+            &addr,
+            config,
+            config_file.as_deref(),
+            webhook_secret.as_deref(),
+        );
     }
 
     let mut schedule = JobScheduler::new();

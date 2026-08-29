@@ -14,6 +14,7 @@ sha2 = "0.10.9"
 toml = "1.1.0"
 job_scheduler_ng = "2.0.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+signal-hook = "0.3.18"
 
 [profile.release]
 lto = true

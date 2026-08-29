@@ -29,6 +29,9 @@ OPTIONS:
                                 GitHub secret or GitLab signing/secret token
         --events                show recent webhook event history
         --retry-event <ID>      retry a failed or dead webhook event
+        --prune-history-days <DAYS>
+                                delete finished SQLite history older than DAYS
+        --backup-state <PATH>   backup one workspace SQLite database
         --once                  run scheduled items once and exit
     -s, --source <SOURCE>       source repo, eg: https://github.com/zcyc/repo-sync.git
     -t, --target <TARGET>...    target repo, eg: https://github.com/zcyc/repo-sync.git
@@ -87,6 +90,7 @@ atomic = true
 max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
+webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MAIN"]
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -110,6 +114,7 @@ atomic = true
 max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
+webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MIRROR"]
 ```
 
 - `source`: The source repository URL
@@ -132,6 +137,7 @@ failure_cooldown_secs = 60
 - `max_retries`: Number of additional attempts for failed Git commands, up to 10.
 - `retry_backoff_secs`: Initial exponential backoff between attempts.
 - `failure_cooldown_secs`: When greater than zero, scheduled runs pause while every target is repeatedly failing; manual `--once` runs are not suppressed.
+- `webhook_secret_envs`: Environment variable names containing the webhook secret. Multiple names allow secret rotation; keep the current and previous secret during the overlap.
 - A `<workspace-name>.sqlite3` database is written next to the workspace with target state, run history, errors, durations, synced ref SHAs, webhook delivery ids, queue state, and dead-letter events. It uses SQLite WAL mode and a busy timeout for safe local readers.
 
 `mirror` mode uses `git clone --mirror`, fetches all refs, and builds an explicit
@@ -148,18 +154,23 @@ requires an existing workspace and performs a target `git push --dry-run`; it
 can change only local remote configuration. `--status` reads the SQLite
 database, and `--status --json` is intended for scripts and monitoring.
 
-`REPO_SYNC_WEBHOOK_SECRET=... repo-sync --serve 127.0.0.1:8080 --file
+`REPO_SYNC_WEBHOOK_SECRET_MAIN=... REPO_SYNC_WEBHOOK_SECRET_MIRROR=... repo-sync --serve 127.0.0.1:8080 --file
 config.toml` starts a webhook listener. It authenticates and parses GitHub
 `push`/`delete` events and GitLab `Push Hook`/`Tag Push Hook` events, matches the
 payload repository and ref against the loaded items, then queues only matching
 syncs. GitHub uses `X-Hub-Signature-256`; GitLab signing tokens and legacy secret
 tokens are accepted. `/healthz` and `/readyz` are available without provider
-headers. The listener returns `202` after SQLite enqueue and a background worker
+headers. Each item reads the environment variables named by
+`webhook_secret_envs`; send `SIGHUP` to reload the TOML and rotate secrets
+without stopping the listener. The listener returns `202` after SQLite enqueue and a background worker
 performs the sync, so provider retries do not block on Git. Put it behind an
 existing TLS reverse proxy and stop it with Ctrl-C. `/metrics` exposes Prometheus
 text metrics for request outcomes, queue status, deduplication, coalescing, and
 sync results; protect it at the reverse proxy if it is not on a private network.
 The listener caps active connections at 64 and returns `503` when saturated.
+For systemd, start from `repo-sync.service.example` and
+`webhook.env.example`; the unit reloads the TOML with `systemctl reload
+repo-sync`.
 
 `--events` shows the latest 50 webhook events per configured workspace;
 `--events --json` is suitable for monitoring. `--retry-event <ID>` resets a
@@ -169,6 +180,9 @@ dead-letter state until manually retried. When several deliveries are waiting,
 one successful full-state sync coalesces the redundant queued deliveries. Event
 IDs are local to each workspace; pass `--workspace <PATH>` with
 `--retry-event <ID>` when the ID exists in more than one workspace.
+`--prune-history-days N` explicitly removes finished run and webhook history
+older than `N` days; `--backup-state PATH` creates a non-overwriting SQLite
+backup. Neither maintenance command runs automatically.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one
@@ -182,8 +196,11 @@ intentionally breaking: existing items must add `workspace`, `mode`,
 `timeout_secs`, `dry_run`, `allow_destructive`, `sync_lfs`, `divergence`,
 `tag_policy`, `prune_branches`, `prune_tags`, `atomic`, `max_retries`,
 `retry_backoff_secs`, `failure_cooldown_secs`, `include_refs`,
-`exclude_refs`, and replace `branch` with `branches`. Previous TOML state files
-and the old generic `X-Repo-Sync-Secret` webhook are not read/accepted; the new
+`exclude_refs`, `webhook_secret_envs`, and replace `branch` with `branches`.
+File-based webhook serving no longer reads the old global
+`REPO_SYNC_WEBHOOK_SECRET`; direct mode requires the explicit
+`--webhook-secret`. Previous TOML state files and the old generic
+`X-Repo-Sync-Secret` webhook are not read/accepted; the new
 SQLite database starts a fresh state record.
 
 For one-time runs, omit `crontab`. When using a configuration file, every item

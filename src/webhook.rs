@@ -15,10 +15,10 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc,
+        Arc, RwLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -45,6 +45,12 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct WebhookItem {
+    item: Item,
+    secrets: Vec<String>,
+}
+
 #[derive(Debug)]
 struct RequestError {
     status: &'static str,
@@ -62,11 +68,13 @@ struct Metrics {
     coalesced_events: AtomicU64,
     successful_syncs: AtomicU64,
     failed_syncs: AtomicU64,
+    sync_duration_ms_total: AtomicU64,
+    sync_duration_count: AtomicU64,
     collection_errors: AtomicU64,
 }
 
 impl Metrics {
-    fn render(&self, config: &[Item]) -> String {
+    fn render(&self, config: &[WebhookItem]) -> String {
         let mut output = String::new();
         output.push_str("# HELP repo_sync_webhook_active_connections Current webhook connections.\n# TYPE repo_sync_webhook_active_connections gauge\n");
         output.push_str(&format!(
@@ -121,30 +129,65 @@ impl Metrics {
             "Failed sync runs",
             self.failed_syncs.load(Ordering::Relaxed),
         );
+        counter_float(
+            &mut output,
+            "repo_sync_sync_duration_seconds_sum",
+            "Total sync duration in seconds",
+            self.sync_duration_ms_total.load(Ordering::Relaxed) as f64 / 1000.0,
+        );
+        counter(
+            &mut output,
+            "repo_sync_sync_duration_seconds_count",
+            "Number of completed sync durations",
+            self.sync_duration_count.load(Ordering::Relaxed),
+        );
         counter(
             &mut output,
             "repo_sync_metrics_collection_errors_total",
             "Metrics collection errors",
             self.collection_errors.load(Ordering::Relaxed),
         );
-        output.push_str("# HELP repo_sync_webhook_events Current webhook events by workspace and status.\n# TYPE repo_sync_webhook_events gauge\n");
+        output.push_str("# HELP repo_sync_webhook_events Current webhook events by status.\n# TYPE repo_sync_webhook_events gauge\n");
+        let mut queue_counts = BTreeMap::new();
+        let mut oldest_pending_ms = None;
         for item in config {
-            match state::webhook_queue_counts(std::path::Path::new(&item.workspace), &item.source) {
-                Ok(counts) => {
-                    for (status, count) in counts {
-                        output.push_str(&format!(
-                            "repo_sync_webhook_events{{workspace=\"{}\",status=\"{}\"}} {count}\n",
-                            escape_label(&item.workspace),
-                            escape_label(&status)
-                        ));
+            match state::webhook_queue_stats(
+                std::path::Path::new(&item.item.workspace),
+                &item.item.source,
+            ) {
+                Ok(stats) => {
+                    for (status, count) in stats.counts {
+                        *queue_counts.entry(status).or_insert(0) += count;
                     }
+                    oldest_pending_ms = match (oldest_pending_ms, stats.oldest_pending_ms) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (None, value) | (value, None) => value,
+                    };
                 }
                 Err(error) => {
                     self.collection_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("metrics collection failed for {}: {error}", item.workspace);
+                    eprintln!(
+                        "metrics collection failed for {}: {error}",
+                        item.item.workspace
+                    );
                 }
             }
         }
+        for (status, count) in queue_counts {
+            output.push_str(&format!(
+                "repo_sync_webhook_events{{status=\"{}\"}} {count}\n",
+                escape_label(&status)
+            ));
+        }
+        output.push_str(
+            "# HELP repo_sync_webhook_oldest_event_age_seconds Age of the oldest pending webhook event.\n# TYPE repo_sync_webhook_oldest_event_age_seconds gauge\n",
+        );
+        let age = oldest_pending_ms
+            .map(|received| state::now_ms().saturating_sub(received).max(0) as f64 / 1000.0)
+            .unwrap_or(0.0);
+        output.push_str(&format!(
+            "repo_sync_webhook_oldest_event_age_seconds {age:.3}\n"
+        ));
         output
     }
 }
@@ -155,6 +198,12 @@ fn counter(output: &mut String, name: &str, help: &str, value: u64) {
     ));
 }
 
+fn counter_float(output: &mut String, name: &str, help: &str, value: f64) {
+    output.push_str(&format!(
+        "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value:.3}\n"
+    ));
+}
+
 fn escape_label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -162,20 +211,19 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn Error>> {
-    for item in &config {
-        config::validate_item(item)?;
-        let db = StateDb::open(std::path::Path::new(&item.workspace), &item.source)?;
-        let now = state::now_ms();
-        db.recover_webhook_events(&item.source, now.saturating_sub(EVENT_RECOVERY_MS), now)?;
-    }
+pub fn serve(
+    addr: &str,
+    config: Vec<Item>,
+    config_path: Option<&str>,
+    direct_secret: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let config = Arc::new(RwLock::new(prepare_webhook_config(&config, direct_secret)?));
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
-    let config = Arc::new(config);
-    let secret = Arc::new(secret.to_owned());
     let metrics = Arc::new(Metrics::default());
     let (wake_sender, wake_receiver) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let reload = register_reload_flag()?;
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_config = Arc::clone(&config);
     let worker_metrics = Arc::clone(&metrics);
@@ -192,6 +240,21 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
 
     eprintln!("webhook listener started on {addr}");
     while !shutdown.load(Ordering::Relaxed) {
+        if reload.swap(false, Ordering::Relaxed) {
+            if let Some(path) = config_path {
+                match config::load(path)
+                    .and_then(|new_config| prepare_webhook_config(&new_config, None))
+                {
+                    Ok(new_config) => {
+                        *config.write().expect("webhook config lock poisoned") = new_config;
+                        eprintln!("webhook configuration reloaded from {path}");
+                    }
+                    Err(error) => eprintln!("webhook configuration reload failed: {error}"),
+                }
+            } else {
+                eprintln!("SIGHUP ignored: direct webhook mode has no config file");
+            }
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if metrics.active_connections.fetch_add(1, Ordering::Relaxed)
@@ -208,11 +271,10 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
                     continue;
                 }
                 let config = Arc::clone(&config);
-                let secret = Arc::clone(&secret);
                 let metrics = Arc::clone(&metrics);
                 let wake_sender = wake_sender.clone();
                 thread::spawn(move || {
-                    handle_connection(stream, &secret, &config, &wake_sender, &metrics);
+                    handle_connection(stream, &config, &wake_sender, &metrics);
                     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -226,6 +288,65 @@ pub fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn 
     let _ = worker.join();
     eprintln!("webhook listener stopped");
     Ok(())
+}
+
+fn prepare_webhook_config(
+    config_items: &[Item],
+    direct_secret: Option<&str>,
+) -> Result<Vec<WebhookItem>, Box<dyn Error>> {
+    config::validate(config_items)?;
+    config_items
+        .iter()
+        .map(|item| {
+            let secrets = if let Some(secret) = direct_secret {
+                if secret.is_empty() {
+                    return Err("webhook secret cannot be empty".into());
+                }
+                vec![secret.to_owned()]
+            } else {
+                let mut secrets = Vec::new();
+                for env_name in &item.webhook_secret_envs {
+                    if env_name.trim().is_empty() {
+                        return Err("webhook_secret_envs cannot contain an empty name".into());
+                    }
+                    let secret = std::env::var(env_name).map_err(|_| {
+                        format!("webhook secret environment variable is not set: {env_name}")
+                    })?;
+                    if secret.is_empty() {
+                        return Err(format!(
+                            "webhook secret environment variable is empty: {env_name}"
+                        )
+                        .into());
+                    }
+                    if !secrets.contains(&secret) {
+                        secrets.push(secret);
+                    }
+                }
+                if secrets.is_empty() {
+                    return Err(format!(
+                        "webhook_secret_envs is required for workspace {}",
+                        item.workspace
+                    )
+                    .into());
+                }
+                secrets
+            };
+            let db = StateDb::open(std::path::Path::new(&item.workspace), &item.source)?;
+            let now = state::now_ms();
+            db.recover_webhook_events(&item.source, now.saturating_sub(EVENT_RECOVERY_MS), now)?;
+            Ok(WebhookItem {
+                item: item.clone(),
+                secrets,
+            })
+        })
+        .collect()
+}
+
+fn register_reload_flag() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&flag))?;
+    Ok(flag)
 }
 
 pub fn retry_event(
@@ -259,15 +380,16 @@ pub fn retry_event(
 }
 
 fn worker_loop(
-    config: Arc<Vec<Item>>,
+    config: Arc<RwLock<Vec<WebhookItem>>>,
     wake_receiver: Receiver<()>,
     shutdown: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
-        for item in config.iter() {
-            if let Err(error) = process_item(item, None, Some(&metrics)) {
-                eprintln!("webhook worker failed for {}: {error}", item.workspace);
+        let items = config.read().expect("webhook config lock poisoned").clone();
+        for item in &items {
+            if let Err(error) = process_item(&item.item, None, Some(&metrics)) {
+                eprintln!("webhook worker failed for {}: {error}", item.item.workspace);
             }
         }
         match wake_receiver.recv_timeout(Duration::from_millis(500)) {
@@ -293,7 +415,15 @@ fn process_item(
         else {
             return Ok(());
         };
+        let started = Instant::now();
         let result = sync::sync(item);
+        if let Some(metrics) = metrics {
+            metrics.sync_duration_ms_total.fetch_add(
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
+        }
         let error = result.as_ref().err().map(ToString::to_string);
         let retry_after =
             state::now_ms().saturating_add(event_retry_delay(item.retry_backoff_secs, attempts));
@@ -341,11 +471,11 @@ fn event_retry_delay(backoff_secs: u64, attempts: i64) -> i64 {
 
 fn handle_connection(
     mut stream: TcpStream,
-    secret: &str,
-    config: &[Item],
+    config: &RwLock<Vec<WebhookItem>>,
     wake_sender: &Sender<()>,
     metrics: &Metrics,
 ) {
+    let config = config.read().expect("webhook config lock poisoned").clone();
     metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -369,7 +499,7 @@ fn handle_connection(
             &mut stream,
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            &metrics.render(config),
+            &metrics.render(&config),
         );
         return;
     }
@@ -378,7 +508,7 @@ fn handle_connection(
         write_response(&mut stream, "405 Method Not Allowed", "POST required");
         return;
     }
-    let event = match parse_event(&request.headers, &request.body, secret) {
+    let event = match parse_event(&request.headers, &request.body) {
         Ok(event) => event,
         Err(error) => {
             metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
@@ -400,11 +530,22 @@ fn handle_connection(
         }
     };
     let mut matched = false;
-    for item in config {
-        if !item_matches(item, &event) {
+    let mut authenticated = false;
+    for webhook_item in &config {
+        if !item_matches(&webhook_item.item, &event) {
             continue;
         }
         matched = true;
+        if !verify_event(
+            &request.headers,
+            &request.body,
+            &event,
+            &webhook_item.secrets,
+        ) {
+            continue;
+        }
+        authenticated = true;
+        let item = &webhook_item.item;
         let db = match StateDb::open(std::path::Path::new(&item.workspace), &item.source) {
             Ok(db) => db,
             Err(error) => {
@@ -434,6 +575,16 @@ fn handle_connection(
                 return;
             }
         }
+    }
+    if matched && !authenticated {
+        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        let message = match event.provider {
+            "github" => "invalid GitHub signature",
+            "gitlab" => "invalid GitLab signature",
+            _ => "invalid webhook signature",
+        };
+        write_response(&mut stream, "401 Unauthorized", message);
+        return;
     }
     if matched {
         write_response(&mut stream, "202 Accepted", "sync queued");
@@ -511,16 +662,8 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
 fn parse_event(
     headers: &BTreeMap<String, String>,
     body: &[u8],
-    secret: &str,
 ) -> Result<Option<WebhookEvent>, RequestError> {
-    let now_secs = state::now_ms() / 1000;
     if let Some(event_type) = headers.get("x-github-event") {
-        if !verify_github_signature(headers, body, secret) {
-            return Err(RequestError {
-                status: "401 Unauthorized",
-                message: "invalid GitHub signature",
-            });
-        }
         let delivery_id = headers
             .get("x-github-delivery")
             .filter(|value| !value.is_empty())
@@ -532,12 +675,6 @@ fn parse_event(
         return parse_github_event(event_type, delivery_id, body);
     }
     if let Some(event_type) = headers.get("x-gitlab-event") {
-        if !verify_gitlab_signature(headers, body, secret, now_secs) {
-            return Err(RequestError {
-                status: "401 Unauthorized",
-                message: "invalid GitLab signature",
-            });
-        }
         let delivery_id = headers
             .get("webhook-id")
             .or_else(|| headers.get("idempotency-key"))
@@ -554,6 +691,23 @@ fn parse_event(
         status: "400 Bad Request",
         message: "unsupported webhook provider",
     })
+}
+
+fn verify_event(
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    event: &WebhookEvent,
+    secrets: &[String],
+) -> bool {
+    match event.provider {
+        "github" => secrets
+            .iter()
+            .any(|secret| verify_github_signature(headers, body, secret)),
+        "gitlab" => secrets
+            .iter()
+            .any(|secret| verify_gitlab_signature(headers, body, secret, state::now_ms() / 1000)),
+        _ => false,
+    }
 }
 
 fn parse_github_event(
@@ -866,7 +1020,7 @@ fn write_response_with_type(stream: &mut TcpStream, status: &str, content_type: 
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_label, parse_event, verify_github_signature, Metrics};
+    use super::{escape_label, parse_event, verify_event, verify_github_signature, Metrics};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -894,7 +1048,8 @@ mod tests {
                     .collect::<String>()
             ),
         );
-        let event = parse_event(&headers, body, "secret").unwrap().unwrap();
+        let event = parse_event(&headers, body).unwrap().unwrap();
+        assert!(verify_event(&headers, body, &event, &["secret".into()]));
         assert_eq!(event.provider, "github");
         assert_eq!(event.refs[0].reference, "refs/heads/main");
         assert!(!event.refs[0].deleted);
@@ -915,9 +1070,13 @@ mod tests {
                     .collect::<String>()
             ),
         );
-        let event = parse_event(&headers, delete_body, "secret")
-            .unwrap()
-            .unwrap();
+        let event = parse_event(&headers, delete_body).unwrap().unwrap();
+        assert!(verify_event(
+            &headers,
+            delete_body,
+            &event,
+            &["secret".into()]
+        ));
         assert_eq!(event.refs[0].reference, "refs/heads/main");
         assert!(event.refs[0].deleted);
     }
@@ -930,16 +1089,21 @@ mod tests {
             ("x-gitlab-token".into(), "secret".into()),
             ("webhook-id".into(), "delivery-2".into()),
         ]);
-        let event = parse_event(&headers, body, "secret").unwrap().unwrap();
+        let event = parse_event(&headers, body).unwrap().unwrap();
+        assert!(verify_event(&headers, body, &event, &["secret".into()]));
         assert_eq!(event.provider, "gitlab");
         assert_eq!(event.refs[0].reference, "refs/heads/main");
 
         let delete_body = br#"{"ref":"refs/tags/v1","before":"abc","after":"0000000000000000000000000000000000000000","project":{"path_with_namespace":"org/repo"}}"#;
         let mut headers = headers;
         headers.insert("x-gitlab-event".into(), "Tag Push Hook".into());
-        let event = parse_event(&headers, delete_body, "secret")
-            .unwrap()
-            .unwrap();
+        let event = parse_event(&headers, delete_body).unwrap().unwrap();
+        assert!(verify_event(
+            &headers,
+            delete_body,
+            &event,
+            &["secret".into()]
+        ));
         assert_eq!(event.refs[0].reference, "refs/tags/v1");
         assert!(event.refs[0].deleted);
     }
@@ -966,7 +1130,8 @@ mod tests {
                 format!("v1,{}", STANDARD.encode(mac.finalize().into_bytes())),
             ),
         ]);
-        let event = parse_event(&headers, body, &secret).unwrap().unwrap();
+        let event = parse_event(&headers, body).unwrap().unwrap();
+        assert!(verify_event(&headers, body, &event, &[secret]));
         assert_eq!(event.provider, "gitlab");
         assert_eq!(event.delivery_id, webhook_id);
     }

@@ -456,6 +456,33 @@ impl StateDb {
             params![source, completed_event_id, finished_ms],
         )
     }
+
+    pub(crate) fn prune_history(
+        &mut self,
+        source: &str,
+        before_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        let transaction = self.connection.transaction()?;
+        let events = transaction.execute(
+            "DELETE FROM webhook_events
+             WHERE source = ?1 AND status IN ('succeeded', 'coalesced', 'dead')
+               AND COALESCE(finished_ms, received_ms) < ?2",
+            params![source, before_ms],
+        )?;
+        let runs = transaction.execute(
+            "DELETE FROM runs
+             WHERE source = ?1 AND finished_ms IS NOT NULL AND finished_ms < ?2",
+            params![source, before_ms],
+        )?;
+        transaction.commit()?;
+        Ok(events + runs)
+    }
+
+    pub(crate) fn backup_into(&self, destination: &Path) -> rusqlite::Result<()> {
+        self.connection
+            .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+        Ok(())
+    }
 }
 
 pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Error>> {
@@ -649,13 +676,21 @@ pub fn webhook_events(
     Ok(events)
 }
 
-pub(crate) fn webhook_queue_counts(
+pub(crate) struct WebhookQueueStats {
+    pub(crate) counts: BTreeMap<String, i64>,
+    pub(crate) oldest_pending_ms: Option<i64>,
+}
+
+pub(crate) fn webhook_queue_stats(
     workspace: &Path,
     source: &str,
-) -> Result<BTreeMap<String, i64>, Box<dyn Error>> {
+) -> Result<WebhookQueueStats, Box<dyn Error>> {
     let path = database_path(workspace)?;
     if !path.exists() {
-        return Ok(BTreeMap::new());
+        return Ok(WebhookQueueStats {
+            counts: BTreeMap::new(),
+            oldest_pending_ms: None,
+        });
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -676,7 +711,19 @@ pub(crate) fn webhook_queue_counts(
     let counts = statement
         .query_map([source], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<BTreeMap<String, i64>>>()?;
-    Ok(counts)
+    let oldest_pending_ms = connection
+        .query_row(
+            "SELECT MIN(received_ms) FROM webhook_events
+             WHERE source = ?1 AND status IN ('queued', 'failed', 'running')",
+            [source],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(WebhookQueueStats {
+        counts,
+        oldest_pending_ms,
+    })
 }
 
 pub fn retry_webhook_event(
@@ -690,6 +737,48 @@ pub fn retry_webhook_event(
     }
     let db = StateDb::open(workspace, source)?;
     Ok(db.retry_webhook_event(source, event_id)?)
+}
+
+pub fn prune_history(
+    workspace: &Path,
+    source: &str,
+    older_than_days: u64,
+) -> Result<usize, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let cutoff = now_ms().saturating_sub(
+        older_than_days
+            .saturating_mul(24 * 60 * 60 * 1000)
+            .try_into()
+            .unwrap_or(i64::MAX),
+    );
+    let mut db = StateDb::open(workspace, source)?;
+    Ok(db.prune_history(source, cutoff)?)
+}
+
+pub fn backup_state(
+    workspace: &Path,
+    source: &str,
+    destination: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Err("state database does not exist".into());
+    }
+    if destination.exists() {
+        return Err("backup destination already exists".into());
+    }
+    if !destination
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty() || parent.exists())
+    {
+        return Err("backup destination parent does not exist".into());
+    }
+    let db = StateDb::open(workspace, source)?;
+    db.backup_into(destination)?;
+    Ok(())
 }
 
 pub(crate) fn has_retryable_webhook_event(
@@ -769,7 +858,7 @@ fn database_path(workspace: &Path) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{webhook_events, StateDb, WebhookRefChange};
+    use super::{backup_state, prune_history, webhook_events, StateDb, WebhookRefChange};
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -857,5 +946,53 @@ mod tests {
         let _ = fs::remove_file(&database);
         let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn maintenance_prunes_finished_history_and_creates_backup() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-maintenance-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://github.com/example/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(db
+            .enqueue_webhook_event(source, "github", "old-success", "push", "[]", 1)
+            .unwrap());
+        let now = super::now_ms();
+        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, None, 2, 2)
+            .unwrap();
+        assert!(db
+            .enqueue_webhook_event(source, "github", "old-dead", "push", "[]", 1)
+            .unwrap());
+        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, Some("failed"), 2, 2)
+            .unwrap();
+        assert!(db
+            .enqueue_webhook_event(source, "github", "pending", "push", "[]", now)
+            .unwrap());
+        drop(db);
+
+        assert_eq!(prune_history(&workspace, source, 1).unwrap(), 2);
+        assert_eq!(webhook_events(&workspace, source, 10).unwrap().len(), 1);
+        let backup = root.join("backup.sqlite3");
+        backup_state(&workspace, source, &backup).unwrap();
+        assert!(backup.exists());
+        assert!(backup_state(&workspace, source, &backup).is_err());
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_file(backup);
+        let _ = fs::remove_dir_all(root);
     }
 }

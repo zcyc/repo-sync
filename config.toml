@@ -24,6 +24,7 @@ atomic = true
 max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
+webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MAIN"]
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -47,3 +48,4 @@ atomic = true
 max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
+webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MIRROR"]

@@ -30,6 +30,7 @@ pub struct Item {
     pub max_retries: u32,
     pub retry_backoff_secs: u64,
     pub failure_cooldown_secs: u64,
+    pub webhook_secret_envs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
@@ -239,6 +240,7 @@ mod tests {
             max_retries: 3,
             retry_backoff_secs: 5,
             failure_cooldown_secs: 60,
+            webhook_secret_envs: Vec::new(),
         }
     }
 
