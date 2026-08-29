@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     error::Error,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -572,7 +572,7 @@ fn worker_loop(
 ) {
     let mut schedule = JobScheduler::new();
     let mut schedule_signature = Vec::new();
-    let mut pending_tasks = BTreeSet::new();
+    let mut pending_tasks = BTreeMap::new();
     while !shutdown.load(Ordering::Relaxed) {
         let items = config.read().expect("webhook config lock poisoned").clone();
         let next_signature = items
@@ -587,12 +587,21 @@ fn worker_loop(
             .collect::<Vec<_>>();
         if next_signature != schedule_signature {
             schedule = JobScheduler::new();
-            pending_tasks.extend(
-                items
-                    .iter()
-                    .filter(|item| item.enabled && Path::new(&item.item.workspace).exists())
-                    .map(|item| item.task_id),
-            );
+            pending_tasks.clear();
+            for item in items.iter().filter(|item| item.enabled) {
+                match state::webhook_queue_stats(Path::new(&item.item.workspace), &item.item.source)
+                {
+                    Ok(stats) => {
+                        if let Some(next_attempt_ms) = stats.next_attempt_ms {
+                            pending_tasks.insert(item.task_id, next_attempt_ms);
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "webhook queue recovery failed for {}: {error}",
+                        item.item.workspace
+                    ),
+                }
+            }
             for item in &items {
                 if !item.enabled {
                     continue;
@@ -613,7 +622,12 @@ fn worker_loop(
             schedule_signature = next_signature;
         }
         schedule.tick();
-        let pending_ids = pending_tasks.iter().copied().collect::<Vec<_>>();
+        let now_ms = state::now_ms();
+        let pending_ids = pending_tasks
+            .iter()
+            .filter(|(_, next_attempt_ms)| **next_attempt_ms <= now_ms)
+            .map(|(task_id, _)| *task_id)
+            .collect::<Vec<_>>();
         for task_id in pending_ids {
             let Some(item) = items
                 .iter()
@@ -626,11 +640,22 @@ fn worker_loop(
                 eprintln!("webhook worker failed for {}: {error}", item.item.workspace);
             }
             pending_tasks.remove(&task_id);
+            match state::webhook_queue_stats(Path::new(&item.item.workspace), &item.item.source) {
+                Ok(stats) => {
+                    if let Some(next_attempt_ms) = stats.next_attempt_ms {
+                        pending_tasks.insert(task_id, next_attempt_ms);
+                    }
+                }
+                Err(error) => eprintln!(
+                    "webhook queue reschedule failed for {}: {error}",
+                    item.item.workspace
+                ),
+            }
         }
         match wake_receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(WorkerCommand::ConfigChanged) => {}
             Ok(WorkerCommand::Webhook(task_id)) => {
-                pending_tasks.insert(task_id);
+                pending_tasks.insert(task_id, 0);
             }
             Ok(WorkerCommand::Scheduled(task_id)) => {
                 let Some(item) = items
@@ -641,7 +666,7 @@ fn worker_loop(
                 };
                 match enqueue_scheduled_item(&item.item, &metrics) {
                     Ok(true) => {
-                        pending_tasks.insert(task_id);
+                        pending_tasks.insert(task_id, 0);
                     }
                     Ok(false) => {}
                     Err(error) => eprintln!(
@@ -938,16 +963,21 @@ fn handle_connection(
             },
             ("POST", task_path) if run_task_id_path(task_path).is_some() => {
                 let task_id = run_task_id_path(task_path).expect("checked task id path");
-                let item = config_store
+                let task = config_store
                     .read()
                     .expect("webhook config lock poisoned")
                     .iter()
                     .find(|item| item.task_id == task_id)
-                    .map(|item| item.item.clone());
-                let Some(item) = item else {
+                    .cloned();
+                let Some(task) = task else {
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
                 };
+                if !task.enabled {
+                    write_response(&mut stream, "409 Conflict", "task is disabled");
+                    return;
+                }
+                let item = task.item;
                 let mut db = match StateDb::open(Path::new(&item.workspace), &item.source) {
                     Ok(db) => db,
                     Err(error) => {
@@ -1028,16 +1058,21 @@ fn handle_connection(
             ("POST", task_path) if retry_event_task_path(task_path).is_some() => {
                 let (task_id, event_id) =
                     retry_event_task_path(task_path).expect("checked event retry path");
-                let item = config_store
+                let task = config_store
                     .read()
                     .expect("webhook config lock poisoned")
                     .iter()
                     .find(|item| item.task_id == task_id)
-                    .map(|item| item.item.clone());
-                let Some(item) = item else {
+                    .cloned();
+                let Some(task) = task else {
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
                 };
+                if !task.enabled {
+                    write_response(&mut stream, "409 Conflict", "task is disabled");
+                    return;
+                }
+                let item = task.item;
                 match state::retry_webhook_event(Path::new(&item.workspace), &item.source, event_id)
                 {
                     Ok(true) => {
@@ -1686,7 +1721,9 @@ fn verify_gitlab_signature(
         else {
             return false;
         };
-        if (now_secs - timestamp).abs() > SIGNATURE_TOLERANCE_SECS {
+        let lower_bound = now_secs.saturating_sub(SIGNATURE_TOLERANCE_SECS);
+        let upper_bound = now_secs.saturating_add(SIGNATURE_TOLERANCE_SECS);
+        if !(lower_bound..=upper_bound).contains(&timestamp) {
             return false;
         }
         let Some(key) = secret
@@ -1898,15 +1935,24 @@ fn write_response_with_cookie_and_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_label, parse_event, verify_event, verify_github_signature, LoginLimiter, Metrics,
+        escape_label, parse_event, verify_event, verify_github_signature, verify_gitlab_signature,
+        LoginLimiter, Metrics,
     };
+    use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     use std::{
         collections::BTreeMap,
+        fs,
         net::{IpAddr, Ipv4Addr},
-        sync::atomic::Ordering,
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, RwLock,
+        },
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     type HmacSha256 = Hmac<Sha256>;
@@ -2041,6 +2087,116 @@ mod tests {
             ("x-hub-signature-256".into(), "sha256=00".into()),
         ]);
         assert!(!verify_github_signature(&headers, body, "secret"));
+    }
+
+    #[test]
+    fn rejects_extreme_gitlab_timestamp_without_panicking() {
+        let headers = BTreeMap::from([
+            ("webhook-signature".into(), "v1,invalid".into()),
+            ("webhook-id".into(), "delivery-extreme".into()),
+            ("webhook-timestamp".into(), i64::MIN.to_string()),
+        ]);
+        assert!(!verify_gitlab_signature(
+            &headers,
+            b"{}",
+            "whsec_invalid",
+            1_700_000_000
+        ));
+    }
+
+    #[test]
+    fn worker_recovers_pending_events_and_retries_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-worker-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let existing_workspace = root.join("existing-workspace");
+        let missing_workspace = root.join("missing-workspace");
+        fs::create_dir_all(&existing_workspace).unwrap();
+
+        let item = |workspace: &Path| Item {
+            source: "source".into(),
+            target: vec!["target".into()],
+            workspace: workspace.to_string_lossy().into_owned(),
+            mode: SyncMode::Branch,
+            crontab: None,
+            branches: Vec::new(),
+            include_refs: Vec::new(),
+            exclude_refs: Vec::new(),
+            timeout_secs: 1,
+            dry_run: true,
+            allow_destructive: false,
+            sync_lfs: false,
+            divergence: DivergencePolicy::Fail,
+            tag_policy: TagPolicy::Preserve,
+            prune_branches: false,
+            prune_tags: false,
+            atomic: true,
+            max_retries: 1,
+            retry_backoff_secs: 1,
+            failure_cooldown_secs: 0,
+            webhook_secret_envs: Vec::new(),
+            webhook_max_pending_events: 10,
+            webhook_event_lease_secs: 1,
+        };
+        let existing_item = item(&existing_workspace);
+        let missing_item = item(&missing_workspace);
+        for value in [&existing_item, &missing_item] {
+            let mut db =
+                super::state::StateDb::open(Path::new(&value.workspace), &value.source).unwrap();
+            assert!(matches!(
+                db.enqueue_manual_event(&value.source, super::state::now_ms(), 10)
+                    .unwrap(),
+                super::state::WebhookEnqueue::Enqueued
+            ));
+        }
+
+        let config = Arc::new(RwLock::new(vec![
+            super::WebhookItem {
+                task_id: 1,
+                enabled: true,
+                item: existing_item.clone(),
+                secrets: Vec::new(),
+            },
+            super::WebhookItem {
+                task_id: 2,
+                enabled: true,
+                item: missing_item.clone(),
+                secrets: Vec::new(),
+            },
+        ]));
+        let (wake_sender, wake_receiver) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let metrics = Arc::new(Metrics::default());
+        let worker = thread::spawn(move || {
+            super::worker_loop(config, wake_receiver, wake_sender, worker_shutdown, metrics)
+        });
+
+        thread::sleep(Duration::from_millis(2_500));
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+
+        let existing_events = super::state::webhook_events(
+            Path::new(&existing_item.workspace),
+            &existing_item.source,
+            10,
+        )
+        .unwrap();
+        assert!(existing_events[0].attempts >= 2);
+        let missing_events = super::state::webhook_events(
+            Path::new(&missing_item.workspace),
+            &missing_item.source,
+            10,
+        )
+        .unwrap();
+        assert!(missing_events[0].attempts >= 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

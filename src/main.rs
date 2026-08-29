@@ -199,7 +199,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         || backup_state.is_some()
         || backup_tasks.is_some()
         || reset_admin;
-
     if check_only && once {
         return Err("--check and --once cannot be used together".into());
     }
@@ -364,7 +363,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             list_tasks(database_path)?
                 .into_iter()
-                .filter(|task| control_command || task.enabled)
+                .filter(|task| (control_command && retry_event.is_none()) || task.enabled)
                 .map(|task| task.item)
                 .collect()
         }

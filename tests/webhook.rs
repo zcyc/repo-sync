@@ -125,7 +125,7 @@ fn accepts_signed_github_webhook_over_http() {
     assert!(dashboard_response.contains("example/repo"));
 
     let config_body = serde_json::to_vec(&serde_json::json!({
-        "item": item,
+        "item": item.clone(),
         "enabled": true
     }))
     .unwrap();
@@ -136,6 +136,20 @@ fn accepts_signed_github_webhook_over_http() {
     );
     let put_response = http_request(&address, &put_request, &config_body);
     assert!(put_response.starts_with("HTTP/1.1 200 OK"));
+
+    let disabled_config_body = serde_json::to_vec(&serde_json::json!({
+        "item": item,
+        "enabled": false
+    }))
+    .unwrap();
+    let disabled_put_request = format!(
+        "PUT /api/tasks/{} HTTP/1.1\r\nHost: localhost\r\nCookie: {session}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        task.id,
+        disabled_config_body.len()
+    );
+    let disabled_put_response =
+        http_request(&address, &disabled_put_request, &disabled_config_body);
+    assert!(disabled_put_response.starts_with("HTTP/1.1 200 OK"));
 
     let logout_response = http_request(
         &address,
@@ -179,6 +193,17 @@ fn accepts_signed_github_webhook_over_http() {
         "POST /api/tasks/{}/run HTTP/1.1\r\nHost: localhost\r\nCookie: {changed_session}\r\nConnection: close\r\n\r\n",
         task.id
     );
+    let run_response = http_request(&address, &run_request, &[]);
+    assert!(run_response.starts_with("HTTP/1.1 409 Conflict"));
+
+    let reenabled_put_request = format!(
+        "PUT /api/tasks/{} HTTP/1.1\r\nHost: localhost\r\nCookie: {changed_session}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        task.id,
+        config_body.len()
+    );
+    let reenabled_put_response = http_request(&address, &reenabled_put_request, &config_body);
+    assert!(reenabled_put_response.starts_with("HTTP/1.1 200 OK"));
+
     let run_response = http_request(&address, &run_request, &[]);
     assert!(run_response.starts_with("HTTP/1.1 202 Accepted"));
 

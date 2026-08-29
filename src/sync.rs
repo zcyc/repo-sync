@@ -1017,11 +1017,16 @@ struct WorkspaceLock {
 
 impl WorkspaceLock {
     fn acquire(workspace: &Path) -> io::Result<Self> {
-        let name = workspace.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "workspace has no file name")
-        })?;
-        let mut path = workspace.to_path_buf();
-        path.set_file_name(format!("{}.lock", name.to_string_lossy()));
+        let workspace = config::workspace_identity(workspace)?;
+        let name = workspace
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "workspace has no file name")
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let mut path = workspace;
+        path.set_file_name(format!("{name}.lock"));
         for attempt in 0..=1 {
             let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => file,

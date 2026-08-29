@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, error::Error, path::Path};
+use std::{
+    collections::HashSet,
+    error::Error,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -60,11 +64,39 @@ pub fn validate(config: &[Item]) -> Result<(), Box<dyn Error>> {
     let mut workspaces = HashSet::new();
     for item in config {
         validate_item(item)?;
-        if !workspaces.insert(&item.workspace) {
+        if !workspaces.insert(workspace_identity(Path::new(&item.workspace))?) {
             return Err(format!("workspace is duplicated: {}", item.workspace).into());
         }
     }
     Ok(())
+}
+
+pub(crate) fn workspace_identity(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(identity) = path.canonicalize() {
+        return Ok(identity);
+    }
+
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace has no file name",
+            )
+        })?;
+        missing.push(name.to_owned());
+        existing = existing
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+    }
+
+    let mut identity = existing.canonicalize()?;
+    for name in missing.iter().rev() {
+        identity.push(name);
+    }
+    Ok(identity)
 }
 
 pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
@@ -220,6 +252,11 @@ mod tests {
     use super::{
         branch_selected, ref_selected, validate, DivergencePolicy, Item, SyncMode, TagPolicy,
     };
+    #[cfg(unix)]
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn item() -> Item {
         Item {
@@ -269,5 +306,30 @@ mod tests {
         let mut config = item();
         config.source = "https://user:secret@example.com/repo.git".into();
         assert!(validate(&[config]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_workspace_symlink_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-config-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let mut first = item();
+        first.workspace = real.to_string_lossy().into_owned();
+        let mut second = item();
+        second.workspace = alias.to_string_lossy().into_owned();
+        assert!(validate(&[first, second]).is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

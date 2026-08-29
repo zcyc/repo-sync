@@ -854,6 +854,7 @@ pub fn webhook_events(
 pub(crate) struct WebhookQueueStats {
     pub(crate) counts: BTreeMap<String, i64>,
     pub(crate) oldest_pending_ms: Option<i64>,
+    pub(crate) next_attempt_ms: Option<i64>,
 }
 
 pub(crate) fn webhook_queue_stats(
@@ -865,6 +866,7 @@ pub(crate) fn webhook_queue_stats(
         return Ok(WebhookQueueStats {
             counts: BTreeMap::new(),
             oldest_pending_ms: None,
+            next_attempt_ms: None,
         });
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -886,9 +888,16 @@ pub(crate) fn webhook_queue_stats(
         )
         .optional()?
         .flatten();
+    let next_attempt_ms = connection.query_row(
+        "SELECT MIN(next_attempt_ms) FROM webhook_events
+         WHERE source = ?1 AND status IN ('queued', 'failed', 'running')",
+        [source],
+        |row| row.get(0),
+    )?;
     Ok(WebhookQueueStats {
         counts,
         oldest_pending_ms,
+        next_attempt_ms,
     })
 }
 
@@ -1031,11 +1040,14 @@ fn configure(connection: &Connection) -> rusqlite::Result<()> {
 }
 
 fn database_path(workspace: &Path) -> io::Result<PathBuf> {
+    let workspace = crate::config::workspace_identity(workspace)?;
     let name = workspace
         .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "workspace has no file name"))?;
-    let mut path = workspace.to_path_buf();
-    path.set_file_name(format!("{}.sqlite3", name.to_string_lossy()));
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "workspace has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let mut path = workspace;
+    path.set_file_name(format!("{name}.sqlite3"));
     Ok(path)
 }
 

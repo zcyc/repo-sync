@@ -1,3 +1,4 @@
+use crate::config;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -24,11 +25,13 @@ pub(crate) struct CancellationScope;
 
 impl CancellationScope {
     pub(crate) fn enter(workspace: &Path) -> Self {
+        let workspace =
+            config::workspace_identity(workspace).unwrap_or_else(|_| workspace.to_owned());
         let generation = CANCELLATION_GENERATIONS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .expect("git cancellation lock poisoned")
-            .get(workspace)
+            .get(&workspace)
             .copied()
             .unwrap_or_default();
         CANCELLATION_SCOPE.with(|scope| {
@@ -48,6 +51,7 @@ impl Drop for CancellationScope {
 }
 
 pub(crate) fn cancel_workspace(workspace: &Path) {
+    let workspace = config::workspace_identity(workspace).unwrap_or_else(|_| workspace.to_owned());
     let mut generations = CANCELLATION_GENERATIONS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
