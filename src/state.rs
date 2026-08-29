@@ -425,6 +425,21 @@ impl StateDb {
         )?;
         Ok(changed == 1)
     }
+
+    pub(crate) fn coalesce_webhook_events(
+        &self,
+        source: &str,
+        completed_event_id: i64,
+        finished_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE webhook_events
+             SET status = 'coalesced', finished_ms = ?3, next_attempt_ms = ?3,
+                 last_error = NULL
+             WHERE source = ?1 AND event_id != ?2 AND status IN ('queued', 'failed')",
+            params![source, completed_event_id, finished_ms],
+        )
+    }
 }
 
 pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Error>> {
@@ -729,6 +744,9 @@ mod tests {
         assert!(!db
             .enqueue_webhook_event(source, "github", "delivery-1", "push", &refs, 1)
             .unwrap());
+        assert!(db
+            .enqueue_webhook_event(source, "github", "delivery-2", "push", &refs, 1)
+            .unwrap());
         let now = super::now_ms();
         let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
         db.finish_webhook_event(
@@ -755,13 +773,20 @@ mod tests {
             retry_now + 1,
         )
         .unwrap();
+        assert_eq!(
+            db.coalesce_webhook_events(source, claimed.event_id, retry_now + 1)
+                .unwrap(),
+            1
+        );
         drop(db);
 
         let history = webhook_events(&workspace, source, 10).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].status, "succeeded");
-        assert_eq!(history[0].refs[0].reference, "refs/heads/main");
-        assert!(!history[0].refs[0].deleted);
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|event| event.status == "succeeded"));
+        assert!(history.iter().any(|event| event.status == "coalesced"));
+        assert!(history
+            .iter()
+            .all(|event| event.refs[0].reference == "refs/heads/main"));
 
         let database = workspace.with_file_name(format!(
             "{}.sqlite3",

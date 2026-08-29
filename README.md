@@ -162,7 +162,8 @@ existing TLS reverse proxy and stop it with Ctrl-C.
 `--events --json` is suitable for monitoring. `--retry-event <ID>` resets a
 failed/dead event and executes it immediately. Event retries use the existing
 `max_retries` and `retry_backoff_secs` settings; exhausted events remain in the
-dead-letter state until manually retried.
+dead-letter state until manually retried. When several deliveries are waiting,
+one successful full-state sync coalesces the redundant queued deliveries.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one

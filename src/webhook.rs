@@ -139,6 +139,10 @@ fn process_item(item: &Item, event_id: Option<i64>) -> Result<(), Box<dyn Error>
             state::now_ms(),
             retry_after,
         )?;
+        if result.is_ok() {
+            // ponytail: a successful full-state sync makes queued notifications redundant.
+            db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
+        }
         if event_id.is_some() {
             return result;
         }
