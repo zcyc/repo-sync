@@ -1,13 +1,11 @@
 use clap::Parser;
 use job_scheduler_ng::{Job, JobScheduler, Schedule};
 use repo_sync::{
-    check, cooldown_active, load, status_report, sync, validate, DivergencePolicy, Item, SyncMode,
-    TagPolicy,
+    check, cooldown_active, load, retry_event as retry_webhook, serve_webhook, status_report, sync,
+    validate, webhook_events, DivergencePolicy, Item, SyncMode, TagPolicy,
 };
 use std::{
     error::Error,
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -97,11 +95,17 @@ struct Args {
     #[clap(long, help = "format --status as JSON")]
     json: bool,
 
-    #[clap(long, help = "listen for generic authenticated HTTP POST triggers")]
+    #[clap(long, help = "listen for GitHub/GitLab webhook POST triggers")]
     serve: Option<String>,
 
-    #[clap(long, help = "shared secret for generic webhook requests")]
+    #[clap(long, help = "GitHub webhook secret or GitLab signing/secret token")]
     webhook_secret: Option<String>,
+
+    #[clap(long, help = "show recent webhook event history")]
+    events: bool,
+
+    #[clap(long, help = "retry a dead or failed webhook event by event id")]
+    retry_event: Option<i64>,
 
     #[clap(long, help = "run scheduled items once and exit")]
     once: bool,
@@ -137,6 +141,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         json,
         serve: serve_addr,
         webhook_secret,
+        events,
+        retry_event,
         once,
     } = Args::parse();
     let webhook_secret = webhook_secret.or_else(|| std::env::var("REPO_SYNC_WEBHOOK_SECRET").ok());
@@ -150,11 +156,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     if status_only && (check_only || once) {
         return Err("--status cannot be combined with --check or --once".into());
     }
-    if json && !status_only {
-        return Err("--json requires --status".into());
+    if json && !status_only && !events {
+        return Err("--json requires --status or --events".into());
     }
-    if serve_addr.is_some() && (check_only || status_only || once) {
-        return Err("--serve cannot be combined with --check, --status, or --once".into());
+    if events
+        && (check_only || status_only || once || serve_addr.is_some() || retry_event.is_some())
+    {
+        return Err("--events cannot be combined with another control command".into());
+    }
+    if retry_event.is_some() && (check_only || status_only || once || serve_addr.is_some()) {
+        return Err("--retry-event cannot be combined with another control command".into());
     }
     if serve_addr.is_some() && webhook_secret.is_none() {
         return Err("--serve requires --webhook-secret or REPO_SYNC_WEBHOOK_SECRET".into());
@@ -276,11 +287,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
+    if events {
+        let history = config
+            .iter()
+            .map(|item| webhook_events(Path::new(&item.workspace), &item.source, 50))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&history)?);
+        } else {
+            for event in history {
+                println!(
+                    "event_id={} workspace={} provider={} type={} status={} attempts={} refs={}",
+                    event.event_id,
+                    event.workspace,
+                    event.provider,
+                    event.event_type,
+                    event.status,
+                    event.attempts,
+                    event
+                        .refs
+                        .iter()
+                        .map(|change| change.reference.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                if let Some(error) = event.last_error {
+                    println!("  error={error}");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let Some(event_id) = retry_event {
+        if retry_webhook(&config, event_id)? {
+            println!("webhook event {event_id} retried");
+            return Ok(());
+        }
+        return Err(format!("webhook event not retryable or not found: {event_id}").into());
+    }
     if once {
         return run_once(config);
     }
     if let Some(addr) = serve_addr {
-        return serve(&addr, webhook_secret.as_deref().unwrap(), config);
+        return serve_webhook(&addr, webhook_secret.as_deref().unwrap(), config);
     }
 
     let mut schedule = JobScheduler::new();
@@ -349,91 +401,4 @@ fn run_once(config: Vec<Item>) -> Result<(), Box<dyn Error>> {
     } else {
         Err(format!("sync failed: {}", failures.join(", ")).into())
     }
-}
-
-fn serve(addr: &str, secret: &str, config: Vec<Item>) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_handler = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Relaxed))?;
-    eprintln!("webhook listener started on {addr}");
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        match listener.accept() {
-            Ok((stream, _)) => handle_webhook(stream, secret, &config),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => eprintln!("webhook connection failed: {error}"),
-        }
-    }
-    eprintln!("webhook listener stopped");
-    Ok(())
-}
-
-fn handle_webhook(mut stream: TcpStream, secret: &str, config: &[Item]) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut request = Vec::new();
-    let mut buffer = [0; 4096];
-    while request.len() < 16 * 1024 {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => {
-                request.extend_from_slice(&buffer[..size]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(error) => {
-                write_response(&mut stream, "400 Bad Request", "invalid request");
-                eprintln!("webhook request read failed: {error}");
-                return;
-            }
-        }
-    }
-    let request = String::from_utf8_lossy(&request);
-    let mut lines = request.split("\r\n");
-    let method = lines.next().unwrap_or_default();
-    if !method.starts_with("POST ") {
-        write_response(&mut stream, "405 Method Not Allowed", "POST required");
-        return;
-    }
-    let provided_secret = lines
-        .by_ref()
-        .take_while(|line| !line.is_empty())
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("x-repo-sync-secret")
-                .then(|| value.trim())
-        })
-        .unwrap_or_default();
-    if !constant_time_equal(provided_secret.as_bytes(), secret.as_bytes()) {
-        write_response(&mut stream, "401 Unauthorized", "invalid webhook secret");
-        return;
-    }
-    write_response(&mut stream, "202 Accepted", "sync accepted");
-    if let Err(error) = run_once(config.to_vec()) {
-        eprintln!("webhook sync failed: {error}");
-    }
-}
-
-fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    for index in 0..left.len().max(right.len()) {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    difference == 0
 }

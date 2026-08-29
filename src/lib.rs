@@ -2,7 +2,12 @@ mod config;
 mod git;
 mod state;
 mod sync;
+mod webhook;
 
 pub use config::{load, validate, validate_item, DivergencePolicy, Item, SyncMode, TagPolicy};
-pub use state::{cooldown_active, status as status_report, StatusReport};
+pub use state::{
+    cooldown_active, retry_webhook_event, status as status_report, webhook_events, StatusReport,
+    WebhookEventStatus, WebhookRefChange,
+};
 pub use sync::{check, sync};
+pub use webhook::{retry_event, serve as serve_webhook};

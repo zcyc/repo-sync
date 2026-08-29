@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_source_started_idx ON runs(source, started_ms DESC);
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    refs_json TEXT NOT NULL,
+    received_ms INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ms INTEGER NOT NULL,
+    started_ms INTEGER,
+    finished_ms INTEGER,
+    last_error TEXT,
+    UNIQUE(source, provider, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS webhook_events_queue_idx
+    ON webhook_events(source, status, next_attempt_ms, received_ms);
+CREATE INDEX IF NOT EXISTS webhook_events_history_idx
+    ON webhook_events(source, received_ms DESC);
 "#;
 
 pub(crate) struct StateDb {
@@ -92,6 +112,36 @@ pub struct TargetStatus {
     pub last_error: Option<String>,
     pub last_duration_ms: Option<i64>,
     pub synced_refs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct WebhookEventStatus {
+    pub workspace: String,
+    pub source: String,
+    pub event_id: i64,
+    pub provider: String,
+    pub delivery_id: String,
+    pub event_type: String,
+    pub refs: Vec<WebhookRefChange>,
+    pub received_ms: i64,
+    pub status: String,
+    pub attempts: i64,
+    pub next_attempt_ms: i64,
+    pub started_ms: Option<i64>,
+    pub finished_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WebhookRefChange {
+    pub reference: String,
+    pub deleted: bool,
+    pub new_sha: Option<String>,
+}
+
+pub(crate) struct QueuedEvent {
+    pub(crate) event_id: i64,
+    pub(crate) attempts: i64,
 }
 
 impl StateDb {
@@ -247,6 +297,134 @@ impl StateDb {
         }
         transaction.commit()
     }
+
+    pub(crate) fn enqueue_webhook_event(
+        &self,
+        source: &str,
+        provider: &str,
+        delivery_id: &str,
+        event_type: &str,
+        refs_json: &str,
+        received_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO webhook_events(
+                 source, provider, delivery_id, event_type, refs_json,
+                 received_ms, next_attempt_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                source,
+                provider,
+                delivery_id,
+                event_type,
+                refs_json,
+                received_ms
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn recover_webhook_events(
+        &self,
+        source: &str,
+        stale_before_ms: i64,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE webhook_events
+             SET status = 'queued', started_ms = NULL, next_attempt_ms = ?2,
+                 last_error = 'worker restarted while event was running'
+             WHERE source = ?1 AND status = 'running' AND started_ms < ?3",
+            params![source, now_ms, stale_before_ms],
+        )
+    }
+
+    pub(crate) fn claim_webhook_event(
+        &mut self,
+        source: &str,
+        now_ms: i64,
+        event_id: Option<i64>,
+    ) -> rusqlite::Result<Option<QueuedEvent>> {
+        let transaction = self.connection.transaction()?;
+        let candidate: Option<(i64, i64)> = match event_id {
+            Some(event_id) => transaction
+                .query_row(
+                    "SELECT event_id, attempts FROM webhook_events
+                     WHERE source = ?1 AND event_id = ?2 AND status IN ('queued', 'failed')
+                       AND next_attempt_ms <= ?3
+                     LIMIT 1",
+                    params![source, event_id, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+            None => transaction
+                .query_row(
+                    "SELECT event_id, attempts FROM webhook_events
+                     WHERE source = ?1 AND status IN ('queued', 'failed')
+                       AND next_attempt_ms <= ?2
+                     ORDER BY received_ms, event_id LIMIT 1",
+                    params![source, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+        };
+        let Some((event_id, attempts)) = candidate else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE webhook_events
+             SET status = 'running', attempts = attempts + 1,
+                 started_ms = ?2, last_error = NULL
+             WHERE event_id = ?1 AND status IN ('queued', 'failed')",
+            params![event_id, now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(Some(QueuedEvent {
+            event_id,
+            attempts: attempts + 1,
+        }))
+    }
+
+    pub(crate) fn finish_webhook_event(
+        &self,
+        event_id: i64,
+        attempts: i64,
+        max_attempts: i64,
+        error: Option<&str>,
+        finished_ms: i64,
+        retry_after_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let (status, next_attempt_ms) = if error.is_none() {
+            ("succeeded", finished_ms)
+        } else if attempts >= max_attempts {
+            ("dead", finished_ms)
+        } else {
+            ("failed", retry_after_ms)
+        };
+        self.connection.execute(
+            "UPDATE webhook_events
+             SET status = ?2, finished_ms = ?3, next_attempt_ms = ?4, last_error = ?5
+             WHERE event_id = ?1",
+            params![event_id, status, finished_ms, next_attempt_ms, error],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn retry_webhook_event(
+        &self,
+        source: &str,
+        event_id: i64,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE webhook_events
+             SET status = 'queued', attempts = 0, next_attempt_ms = ?3,
+                 started_ms = NULL, finished_ms = NULL, last_error = NULL
+             WHERE source = ?1 AND event_id = ?2 AND status IN ('failed', 'dead')",
+            params![source, event_id, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
 }
 
 pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Error>> {
@@ -360,6 +538,99 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
     })
 }
 
+pub fn webhook_events(
+    workspace: &Path,
+    source: &str,
+    limit: usize,
+) -> Result<Vec<WebhookEventStatus>, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let stored_source: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored_source.as_deref() != Some(source) {
+        return Err("state database source does not match configuration source".into());
+    }
+    let mut statement = connection.prepare(
+        "SELECT event_id, provider, delivery_id, event_type, refs_json,
+                received_ms, status, attempts, next_attempt_ms, started_ms,
+                finished_ms, last_error
+         FROM webhook_events WHERE source = ?1
+         ORDER BY received_ms DESC, event_id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![source, limit as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+        ))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            event_id,
+            provider,
+            delivery_id,
+            event_type,
+            refs_json,
+            received_ms,
+            event_status,
+            attempts,
+            next_attempt_ms,
+            started_ms,
+            finished_ms,
+            last_error,
+        ) = row?;
+        events.push(WebhookEventStatus {
+            workspace: workspace.to_string_lossy().into_owned(),
+            source: source.into(),
+            event_id,
+            provider,
+            delivery_id,
+            event_type,
+            refs: serde_json::from_str(&refs_json)?,
+            received_ms,
+            status: event_status,
+            attempts,
+            next_attempt_ms,
+            started_ms,
+            finished_ms,
+            last_error,
+        });
+    }
+    Ok(events)
+}
+
+pub fn retry_webhook_event(
+    workspace: &Path,
+    source: &str,
+    event_id: i64,
+) -> Result<bool, Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let db = StateDb::open(workspace, source)?;
+    Ok(db.retry_webhook_event(source, event_id)?)
+}
+
 pub fn cooldown_active(
     workspace: &Path,
     source: &str,
@@ -420,4 +691,84 @@ fn database_path(workspace: &Path) -> io::Result<PathBuf> {
     let mut path = workspace.to_path_buf();
     path.set_file_name(format!("{}.sqlite3", name.to_string_lossy()));
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{webhook_events, StateDb, WebhookRefChange};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static NEXT_STATE_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn webhook_delivery_is_idempotent_and_retriable() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let workspace = std::env::temp_dir().join(format!(
+            "repo-sync-state-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = "https://github.com/example/source.git";
+        let refs = serde_json::to_string(&vec![WebhookRefChange {
+            reference: "refs/heads/main".into(),
+            deleted: false,
+            new_sha: Some("abc".into()),
+        }])
+        .unwrap();
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(db
+            .enqueue_webhook_event(source, "github", "delivery-1", "push", &refs, 1)
+            .unwrap());
+        assert!(!db
+            .enqueue_webhook_event(source, "github", "delivery-1", "push", &refs, 1)
+            .unwrap());
+        let now = super::now_ms();
+        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        db.finish_webhook_event(
+            claimed.event_id,
+            claimed.attempts,
+            1,
+            Some("failed"),
+            now + 1,
+            now + 1,
+        )
+        .unwrap();
+        assert!(db.retry_webhook_event(source, claimed.event_id).unwrap());
+        let retry_now = super::now_ms();
+        let claimed = db
+            .claim_webhook_event(source, retry_now, Some(claimed.event_id))
+            .unwrap()
+            .unwrap();
+        db.finish_webhook_event(
+            claimed.event_id,
+            claimed.attempts,
+            1,
+            None,
+            retry_now + 1,
+            retry_now + 1,
+        )
+        .unwrap();
+        drop(db);
+
+        let history = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "succeeded");
+        assert_eq!(history[0].refs[0].reference, "refs/heads/main");
+        assert!(!history[0].refs[0].deleted);
+
+        let database = workspace.with_file_name(format!(
+            "{}.sqlite3",
+            workspace.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
 }
