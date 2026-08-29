@@ -1,9 +1,9 @@
 use clap::Parser;
 use job_scheduler_ng::{Job, JobScheduler, Schedule};
 use repo_sync::{
-    check, check_task_database, cooldown_active, list_tasks, retry_event as retry_webhook,
-    serve_webhook, status_report, sync, validate, webhook_events, DivergencePolicy, Item, SyncMode,
-    TagPolicy,
+    backup_task_database, check, check_task_database, cooldown_active, list_tasks,
+    retry_event as retry_webhook, serve_webhook, status_report, sync, validate, webhook_events,
+    DivergencePolicy, Item, SyncMode, TagPolicy,
 };
 use std::{
     error::Error,
@@ -136,6 +136,15 @@ struct Args {
     )]
     backup_state: Option<String>,
 
+    #[clap(long, value_name = "PATH", help = "backup the SQLite task database")]
+    backup_tasks: Option<String>,
+
+    #[clap(
+        long,
+        help = "remove the administrator account and require first-use setup"
+    )]
+    reset_admin: bool,
+
     #[clap(long, help = "run scheduled items once and exit")]
     once: bool,
 }
@@ -175,6 +184,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         retry_event,
         prune_history_days,
         backup_state,
+        backup_tasks,
+        reset_admin,
         once,
     } = Args::parse();
     let retry_workspace = workspace.clone();
@@ -185,7 +196,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         || events
         || retry_event.is_some()
         || prune_history_days.is_some()
-        || backup_state.is_some();
+        || backup_state.is_some()
+        || backup_tasks.is_some()
+        || reset_admin;
 
     if check_only && once {
         return Err("--check and --once cannot be used together".into());
@@ -235,10 +248,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("--backup-state cannot be combined with another control command".into());
     }
+    if backup_tasks.is_some()
+        && (direct_mode
+            || check_only
+            || status_only
+            || once
+            || serve_addr.is_some()
+            || retry_event.is_some()
+            || events
+            || prune_history_days.is_some()
+            || backup_state.is_some())
+    {
+        return Err("--backup-tasks cannot be combined with another control command".into());
+    }
+    if reset_admin
+        && (direct_mode
+            || check_only
+            || status_only
+            || once
+            || serve_addr.is_some()
+            || retry_event.is_some()
+            || events
+            || prune_history_days.is_some()
+            || backup_state.is_some()
+            || backup_tasks.is_some())
+    {
+        return Err("--reset-admin cannot be combined with another control command".into());
+    }
     if serve_addr.is_some() && direct_mode {
         return Err(
             "--serve uses tasks from --database; direct sync options are not supported".into(),
         );
+    }
+
+    if let Some(destination) = backup_tasks {
+        backup_task_database(database_path, Path::new(&destination))?;
+        println!("SQLite task database backed up to {destination}");
+        return Ok(());
+    }
+    if reset_admin {
+        if repo_sync::reset_admin(database_path)? {
+            println!("administrator account reset; set a new account and password in the Web page");
+        } else {
+            println!("no administrator account was initialized");
+        }
+        return Ok(());
     }
 
     let config = match (source, target) {

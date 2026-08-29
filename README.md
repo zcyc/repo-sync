@@ -34,6 +34,8 @@ OPTIONS:
         --prune-history-days <DAYS>
                                 delete finished SQLite history older than DAYS
         --backup-state <PATH>   backup one workspace SQLite database
+        --backup-tasks <PATH>   backup the SQLite task database
+        --reset-admin           clear the administrator account for offline recovery
         --once                  run scheduled items once and exit
     -s, --source <SOURCE>       source repo, eg: https://github.com/zcyc/repo-sync.git
     -t, --target <TARGET>...    target repo, eg: https://github.com/zcyc/repo-sync.git
@@ -74,7 +76,9 @@ edit, enable, disable, or delete tasks. The page validates each task before
 saving it. A task contains the source
 and targets, workspace, branch/ref filters, safety policies, retry settings,
 schedule, and webhook secret environment variable names. Secret values are
-never stored in SQLite or returned by the API.
+never stored in SQLite or returned by the API. The page also supports an
+immediate manual sync and password changes; changing the password invalidates
+all existing sessions and signs in the current browser again.
 
 The task registry database and each workspace's `<workspace-name>.sqlite3`
 runtime state database are separate. The latter stores target state, run
@@ -109,6 +113,10 @@ existing TLS reverse proxy and stop it with Ctrl-C. `/metrics` exposes Prometheu
 text metrics for request outcomes, queue status, deduplication, coalescing, and
 sync results; protect it at the reverse proxy if it is not on a private network.
 The listener caps active connections at 64 and returns `503` when saturated.
+Login failures are limited per client address: five failures in one minute
+temporarily block further login attempts for five minutes. The worker reacts
+to matching Webhook deliveries and manual runs immediately instead of scanning
+every task on a fixed polling interval.
 For systemd, start from `repo-sync.service.example` and
 `webhook.env.example`; the example keeps the task database in
 `/var/lib/repo-sync` and the secrets in `/etc/repo-sync`. `systemctl reload
@@ -151,7 +159,13 @@ IDs are local to each workspace; pass `--workspace <PATH>` with
 `--prune-history-days N` explicitly removes finished run and webhook history
 older than `N` days; `N` must be at least 7 so provider delivery IDs remain
 deduplicated across normal redeliveries. `--backup-state PATH` creates a
-non-overwriting SQLite backup. Neither maintenance command runs automatically.
+non-overwriting workspace SQLite backup. `--backup-tasks PATH` creates a
+non-overwriting task-registry SQLite backup. The destination must not already
+exist, so use a timestamped filename. These maintenance commands never run
+automatically. If the administrator password is lost, stop the listener and
+run `repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --reset-admin`;
+the next visit to `/` will require setting a new account and password. This
+clears only the administrator account and sessions, not tasks or workspaces.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one

@@ -50,6 +50,8 @@ pub struct Task {
     pub id: i64,
     pub enabled: bool,
     pub item: Item,
+    pub created_ms: i64,
+    pub updated_ms: i64,
 }
 
 #[derive(Debug)]
@@ -102,22 +104,31 @@ impl TaskDb {
     }
 
     pub(crate) fn list(&self) -> Result<Vec<Task>, Box<dyn Error>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT task_id, enabled, config_json FROM tasks ORDER BY task_id")?;
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, enabled, config_json, created_ms, updated_ms
+                 FROM tasks ORDER BY task_id",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)? != 0,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let (id, enabled, config_json) = row?;
+            let (id, enabled, config_json, created_ms, updated_ms) = row?;
             let item: Item = serde_json::from_str(&config_json)?;
             validate_item(&item)?;
-            tasks.push(Task { id, enabled, item });
+            tasks.push(Task {
+                id,
+                enabled,
+                item,
+                created_ms,
+                updated_ms,
+            });
         }
         Ok(tasks)
     }
@@ -146,6 +157,8 @@ impl TaskDb {
             id,
             enabled,
             item: item.clone(),
+            created_ms: now,
+            updated_ms: now,
         })
     }
 
@@ -157,6 +170,18 @@ impl TaskDb {
     ) -> Result<Option<Task>, Box<dyn Error>> {
         validate_item(item)?;
         let config_json = serde_json::to_string(item)?;
+        let created_ms: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT created_ms FROM tasks WHERE task_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(created_ms) = created_ms else {
+            return Ok(None);
+        };
+        let updated_ms = now_ms();
         let changed = self.connection.execute(
             "UPDATE tasks
              SET enabled = ?2, source = ?3, workspace = ?4, config_json = ?5, updated_ms = ?6
@@ -167,7 +192,7 @@ impl TaskDb {
                 item.source,
                 item.workspace,
                 config_json,
-                now_ms()
+                updated_ms
             ],
         )?;
         if changed == 0 {
@@ -177,6 +202,8 @@ impl TaskDb {
             id,
             enabled,
             item: item.clone(),
+            created_ms,
+            updated_ms,
         }))
     }
 
@@ -231,6 +258,9 @@ impl TaskDb {
         username: &str,
         password: &str,
     ) -> Result<LoginSession, Box<dyn Error>> {
+        if validate_credentials(username, password).is_err() {
+            return Err("invalid username or password".into());
+        }
         let account: Option<(String, String)> = self
             .connection
             .query_row(
@@ -279,6 +309,62 @@ impl TaskDb {
             [token_hash(token)],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn reset_admin(&mut self) -> rusqlite::Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = transaction.execute("DELETE FROM admin_account WHERE id = 1", [])?;
+        transaction.execute("DELETE FROM admin_sessions", [])?;
+        transaction.commit()?;
+        Ok(deleted == 1)
+    }
+
+    pub(crate) fn change_password(
+        &mut self,
+        token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<LoginSession, Box<dyn Error>> {
+        let now = now_ms();
+        let username: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT username FROM admin_sessions
+                 WHERE token_hash = ?1 AND expires_ms > ?2",
+                params![token_hash(token), now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(username) = username else {
+            return Err("login session is invalid or expired".into());
+        };
+        let password_hash: String = self.connection.query_row(
+            "SELECT password_hash FROM admin_account WHERE id = 1 AND username = ?1",
+            [&username],
+            |row| row.get(0),
+        )?;
+        validate_credentials(&username, current_password)?;
+        let parsed_hash = PasswordHash::new(&password_hash)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        Argon2::default()
+            .verify_password(current_password.as_bytes(), &parsed_hash)
+            .map_err(|_| "current password is invalid")?;
+        validate_credentials(&username, new_password)?;
+        let new_hash = hash_password(new_password)?;
+        let session = new_session(&username);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE admin_account SET password_hash = ?1 WHERE id = 1",
+            [&new_hash],
+        )?;
+        transaction.execute("DELETE FROM admin_sessions", [])?;
+        insert_session(&transaction, &session, now)?;
+        transaction.commit()?;
+        Ok(session)
     }
 }
 
@@ -332,6 +418,41 @@ pub(crate) fn authenticate_session(
 
 pub(crate) fn logout_session(path: &Path, token: &str) -> Result<(), Box<dyn Error>> {
     TaskDb::open(path)?.logout_session(token)?;
+    Ok(())
+}
+
+pub fn reset_admin(path: &Path) -> Result<bool, Box<dyn Error>> {
+    if !path.exists() {
+        return Err("task database does not exist".into());
+    }
+    Ok(TaskDb::open(path)?.reset_admin()?)
+}
+
+pub(crate) fn change_password(
+    path: &Path,
+    token: &str,
+    current_password: &str,
+    new_password: &str,
+) -> Result<LoginSession, Box<dyn Error>> {
+    TaskDb::open(path)?.change_password(token, current_password, new_password)
+}
+
+pub fn backup_task_database(path: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    if !path.exists() {
+        return Err("task database does not exist".into());
+    }
+    if destination.exists() {
+        return Err("backup destination already exists".into());
+    }
+    if !destination
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty() || parent.exists())
+    {
+        return Err("backup destination parent does not exist".into());
+    }
+    let db = TaskDb::open(path)?;
+    db.connection
+        .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
     Ok(())
 }
 
@@ -423,7 +544,7 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskDb;
+    use super::{backup_task_database, TaskDb};
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use std::{
         fs,
@@ -484,6 +605,47 @@ mod tests {
         assert!(!updated.enabled);
         assert!(db.delete(task.id).unwrap());
         assert!(db.list().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_database_supports_auth_and_backup() {
+        let sequence = NEXT_TASK_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-auth-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("tasks.sqlite3");
+        let backup = root.join("tasks-backup.sqlite3");
+        let mut db = TaskDb::open(&database).unwrap();
+        let session = db
+            .setup_admin("admin", "correct horse battery staple")
+            .unwrap();
+        assert!(db.auth_initialized().unwrap());
+        assert!(db.authenticate_session(&session.token).unwrap().is_some());
+        let new_session = db
+            .change_password(
+                &session.token,
+                "correct horse battery staple",
+                "another correct battery phrase",
+            )
+            .unwrap();
+        assert!(db.authenticate_session(&session.token).unwrap().is_none());
+        assert!(db
+            .login_admin("admin", "another correct battery phrase")
+            .is_ok());
+        assert_ne!(session.token, new_session.token);
+        drop(db);
+        backup_task_database(&database, &backup).unwrap();
+        assert!(backup.exists());
+        let mut db = TaskDb::open(&database).unwrap();
+        assert!(db.reset_admin().unwrap());
+        assert!(!db.auth_initialized().unwrap());
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -12,15 +12,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -32,6 +32,9 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: u64 = 64;
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
+const LOGIN_FAILURE_LIMIT: u32 = 5;
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_BLOCK: Duration = Duration::from_secs(300);
 const SECURITY_HEADERS: &str =
     "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
 
@@ -59,6 +62,69 @@ struct WebhookItem {
     secrets: Vec<String>,
 }
 
+enum WorkerCommand {
+    ConfigChanged,
+    Webhook(i64),
+    Manual { task_id: i64, item: Box<Item> },
+}
+
+#[derive(Default)]
+struct LoginLimiter {
+    attempts: Mutex<HashMap<IpAddr, LoginAttempt>>,
+}
+
+struct LoginAttempt {
+    window_started: Instant,
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl LoginLimiter {
+    fn allowed(&self, address: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut attempts = self.attempts.lock().expect("login limiter lock poisoned");
+        attempts.retain(|_, attempt| {
+            attempt
+                .blocked_until
+                .is_some_and(|blocked_until| blocked_until > now)
+                || now.duration_since(attempt.window_started) < LOGIN_WINDOW
+        });
+        let attempt = attempts.entry(address).or_insert(LoginAttempt {
+            window_started: now,
+            failures: 0,
+            blocked_until: None,
+        });
+        attempt
+            .blocked_until
+            .is_none_or(|blocked_until| blocked_until <= now)
+    }
+
+    fn record_failure(&self, address: IpAddr) {
+        let now = Instant::now();
+        let mut attempts = self.attempts.lock().expect("login limiter lock poisoned");
+        let attempt = attempts.entry(address).or_insert(LoginAttempt {
+            window_started: now,
+            failures: 0,
+            blocked_until: None,
+        });
+        if now.duration_since(attempt.window_started) >= LOGIN_WINDOW {
+            attempt.window_started = now;
+            attempt.failures = 0;
+        }
+        attempt.failures = attempt.failures.saturating_add(1);
+        if attempt.failures >= LOGIN_FAILURE_LIMIT {
+            attempt.blocked_until = Some(now + LOGIN_BLOCK);
+        }
+    }
+
+    fn record_success(&self, address: IpAddr) {
+        self.attempts
+            .lock()
+            .expect("login limiter lock poisoned")
+            .remove(&address);
+    }
+}
+
 #[derive(Debug)]
 struct RequestError {
     status: &'static str,
@@ -80,6 +146,8 @@ struct Metrics {
     sync_duration_ms_total: AtomicU64,
     sync_duration_count: AtomicU64,
     collection_errors: AtomicU64,
+    auth_failures: AtomicU64,
+    auth_rate_limited: AtomicU64,
 }
 
 impl Metrics {
@@ -162,6 +230,18 @@ impl Metrics {
             "Metrics collection errors",
             self.collection_errors.load(Ordering::Relaxed),
         );
+        counter(
+            &mut output,
+            "repo_sync_auth_failures_total",
+            "Failed administrator logins",
+            self.auth_failures.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_auth_rate_limited_total",
+            "Administrator logins rejected by rate limiting",
+            self.auth_rate_limited.load(Ordering::Relaxed),
+        );
         output.push_str("# HELP repo_sync_webhook_events Current webhook events by status.\n# TYPE repo_sync_webhook_events gauge\n");
         let mut queue_counts = BTreeMap::new();
         let mut oldest_pending_ms = None;
@@ -234,6 +314,12 @@ struct AuthRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct PasswordChangeRequest {
+    current_password: String,
+    new_password: String,
+}
+
 #[derive(Serialize)]
 struct DashboardQueue {
     counts: BTreeMap<String, i64>,
@@ -278,6 +364,13 @@ fn task_id_path(path: &str) -> Option<i64> {
     path.strip_prefix("/api/tasks/")?.parse().ok()
 }
 
+fn run_task_id_path(path: &str) -> Option<i64> {
+    path.strip_prefix("/api/tasks/")?
+        .strip_suffix("/run")?
+        .parse()
+        .ok()
+}
+
 fn counter(output: &mut String, name: &str, help: &str, value: u64) {
     output.push_str(&format!(
         "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n"
@@ -305,6 +398,7 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
     listener.set_nonblocking(true)?;
     let metrics = Arc::new(Metrics::default());
     let (wake_sender, wake_receiver) = mpsc::channel();
+    let login_limiter = Arc::new(LoginLimiter::default());
     let shutdown = Arc::new(AtomicBool::new(false));
     let reload = register_reload_flag()?;
     let worker_shutdown = Arc::clone(&shutdown);
@@ -329,13 +423,14 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
             {
                 Ok(new_config) => {
                     *config.write().expect("webhook config lock poisoned") = new_config;
+                    let _ = wake_sender.send(WorkerCommand::ConfigChanged);
                     eprintln!("webhook tasks reloaded from {}", database_path.display());
                 }
                 Err(error) => eprintln!("webhook task reload failed: {error}"),
             }
         }
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 if metrics.active_connections.fetch_add(1, Ordering::Relaxed)
                     >= MAX_ACTIVE_CONNECTIONS
                 {
@@ -353,8 +448,17 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
                 let database_path = database_path.clone();
                 let metrics = Arc::clone(&metrics);
                 let wake_sender = wake_sender.clone();
+                let login_limiter = Arc::clone(&login_limiter);
                 thread::spawn(move || {
-                    handle_connection(stream, &config, &database_path, &wake_sender, &metrics);
+                    handle_connection(
+                        stream,
+                        peer,
+                        &config,
+                        &database_path,
+                        &wake_sender,
+                        &metrics,
+                        &login_limiter,
+                    );
                     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -439,12 +543,13 @@ pub fn retry_event(
 
 fn worker_loop(
     config: Arc<RwLock<Vec<WebhookItem>>>,
-    wake_receiver: Receiver<()>,
+    wake_receiver: Receiver<WorkerCommand>,
     shutdown: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 ) {
     let mut schedule = JobScheduler::new();
     let mut schedule_signature = Vec::new();
+    let mut pending_tasks = BTreeSet::new();
     while !shutdown.load(Ordering::Relaxed) {
         let items = config.read().expect("webhook config lock poisoned").clone();
         let next_signature = items
@@ -459,6 +564,12 @@ fn worker_loop(
             .collect::<Vec<_>>();
         if next_signature != schedule_signature {
             schedule = JobScheduler::new();
+            pending_tasks.extend(
+                items
+                    .iter()
+                    .filter(|item| item.enabled && Path::new(&item.item.workspace).exists())
+                    .map(|item| item.task_id),
+            );
             for item in &items {
                 if !item.enabled {
                     continue;
@@ -476,18 +587,49 @@ fn worker_loop(
             schedule_signature = next_signature;
         }
         schedule.tick();
-        for item in &items {
-            if !item.enabled {
+        let pending_ids = pending_tasks.iter().copied().collect::<Vec<_>>();
+        for task_id in pending_ids {
+            let Some(item) = items
+                .iter()
+                .find(|item| item.task_id == task_id && item.enabled)
+            else {
+                pending_tasks.remove(&task_id);
                 continue;
-            }
+            };
             if let Err(error) = process_item(&item.item, None, Some(&metrics)) {
                 eprintln!("webhook worker failed for {}: {error}", item.item.workspace);
             }
+            pending_tasks.remove(&task_id);
         }
         match wake_receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(WorkerCommand::ConfigChanged) => {}
+            Ok(WorkerCommand::Webhook(task_id)) => {
+                pending_tasks.insert(task_id);
+            }
+            Ok(WorkerCommand::Manual { task_id, item }) => {
+                run_manual_item(task_id, &item, &metrics);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+fn run_manual_item(task_id: i64, item: &Item, metrics: &Metrics) {
+    let started = Instant::now();
+    let result = sync::sync(item);
+    metrics.sync_duration_ms_total.fetch_add(
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
+    if result.is_ok() {
+        metrics.successful_syncs.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.failed_syncs.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Err(error) = result {
+        eprintln!("manual sync task {task_id} failed: {error}");
     }
 }
 
@@ -585,10 +727,12 @@ fn event_retry_delay(backoff_secs: u64, attempts: i64) -> i64 {
 
 fn handle_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     config_store: &RwLock<Vec<WebhookItem>>,
     database_path: &Path,
-    wake_sender: &Sender<()>,
+    wake_sender: &Sender<WorkerCommand>,
     metrics: &Metrics,
+    login_limiter: &LoginLimiter,
 ) {
     metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = match read_request(&mut stream) {
@@ -631,7 +775,15 @@ fn handle_connection(
         return;
     }
     if path.starts_with("/api/auth/") {
-        handle_auth_request(&mut stream, database_path, &request, path, metrics);
+        handle_auth_request(
+            &mut stream,
+            peer,
+            database_path,
+            &request,
+            path,
+            metrics,
+            login_limiter,
+        );
         return;
     }
     if path.starts_with("/api/") {
@@ -702,22 +854,25 @@ fn handle_connection(
                     task_request.enabled,
                 ) {
                     Ok(task) => match reload_task_config(database_path, config_store) {
-                        Ok(()) => match serde_json::to_string(&task) {
-                            Ok(body) => write_response_with_type(
-                                &mut stream,
-                                "201 Created",
-                                "application/json; charset=utf-8",
-                                &body,
-                            ),
-                            Err(error) => {
-                                eprintln!("dashboard task serialization failed: {error}");
-                                write_response(
+                        Ok(()) => {
+                            let _ = wake_sender.send(WorkerCommand::ConfigChanged);
+                            match serde_json::to_string(&task) {
+                                Ok(body) => write_response_with_type(
                                     &mut stream,
-                                    "500 Internal Server Error",
-                                    "task unavailable",
-                                );
+                                    "201 Created",
+                                    "application/json; charset=utf-8",
+                                    &body,
+                                ),
+                                Err(error) => {
+                                    eprintln!("dashboard task serialization failed: {error}");
+                                    write_response(
+                                        &mut stream,
+                                        "500 Internal Server Error",
+                                        "task unavailable",
+                                    );
+                                }
                             }
-                        },
+                        }
                         Err(error) => {
                             eprintln!("dashboard task reload failed: {error}");
                             write_response(
@@ -737,6 +892,30 @@ fn handle_connection(
                     write_response(&mut stream, "400 Bad Request", "invalid task request");
                 }
             },
+            ("POST", task_path) if run_task_id_path(task_path).is_some() => {
+                let task_id = run_task_id_path(task_path).expect("checked task id path");
+                let item = config_store
+                    .read()
+                    .expect("webhook config lock poisoned")
+                    .iter()
+                    .find(|item| item.task_id == task_id)
+                    .map(|item| item.item.clone());
+                let Some(item) = item else {
+                    write_response(&mut stream, "404 Not Found", "unknown task");
+                    return;
+                };
+                let _ = wake_sender.send(WorkerCommand::Manual {
+                    task_id,
+                    item: Box::new(item),
+                });
+                let body = format!(r#"{{"task_id":{task_id},"status":"queued"}}"#);
+                write_response_with_type(
+                    &mut stream,
+                    "202 Accepted",
+                    "application/json; charset=utf-8",
+                    &body,
+                );
+            }
             ("PUT", task_path) => {
                 let Some(task_id) = task_id_path(task_path) else {
                     metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
@@ -751,22 +930,25 @@ fn handle_connection(
                         task_request.enabled,
                     ) {
                         Ok(Some(task)) => match reload_task_config(database_path, config_store) {
-                            Ok(()) => match serde_json::to_string(&task) {
-                                Ok(body) => write_response_with_type(
-                                    &mut stream,
-                                    "200 OK",
-                                    "application/json; charset=utf-8",
-                                    &body,
-                                ),
-                                Err(error) => {
-                                    eprintln!("dashboard task serialization failed: {error}");
-                                    write_response(
+                            Ok(()) => {
+                                let _ = wake_sender.send(WorkerCommand::ConfigChanged);
+                                match serde_json::to_string(&task) {
+                                    Ok(body) => write_response_with_type(
                                         &mut stream,
-                                        "500 Internal Server Error",
-                                        "task unavailable",
-                                    );
+                                        "200 OK",
+                                        "application/json; charset=utf-8",
+                                        &body,
+                                    ),
+                                    Err(error) => {
+                                        eprintln!("dashboard task serialization failed: {error}");
+                                        write_response(
+                                            &mut stream,
+                                            "500 Internal Server Error",
+                                            "task unavailable",
+                                        );
+                                    }
                                 }
-                            },
+                            }
                             Err(error) => {
                                 eprintln!("dashboard task reload failed: {error}");
                                 write_response(
@@ -796,7 +978,10 @@ fn handle_connection(
                 };
                 match tasks::delete_task(database_path, task_id) {
                     Ok(true) => match reload_task_config(database_path, config_store) {
-                        Ok(()) => write_response(&mut stream, "204 No Content", ""),
+                        Ok(()) => {
+                            let _ = wake_sender.send(WorkerCommand::ConfigChanged);
+                            write_response(&mut stream, "204 No Content", "")
+                        }
                         Err(error) => {
                             eprintln!("dashboard task reload failed: {error}");
                             write_response(
@@ -896,7 +1081,7 @@ fn handle_connection(
         ) {
             Ok(WebhookEnqueue::Enqueued) => {
                 metrics.enqueued_events.fetch_add(1, Ordering::Relaxed);
-                let _ = wake_sender.send(());
+                let _ = wake_sender.send(WorkerCommand::Webhook(webhook_item.task_id));
             }
             Ok(WebhookEnqueue::Duplicate) => {
                 metrics.deduplicated_events.fetch_add(1, Ordering::Relaxed);
@@ -942,10 +1127,12 @@ fn handle_connection(
 
 fn handle_auth_request(
     stream: &mut TcpStream,
+    peer: SocketAddr,
     database_path: &Path,
     request: &HttpRequest,
     path: &str,
     metrics: &Metrics,
+    login_limiter: &LoginLimiter,
 ) {
     match (request.method.as_str(), path) {
         ("GET", "/api/auth/status") => match tasks::auth_initialized(database_path) {
@@ -986,17 +1173,68 @@ fn handle_auth_request(
             }
         }
         ("POST", "/api/auth/login") => {
+            if !login_limiter.allowed(peer.ip()) {
+                metrics.auth_rate_limited.fetch_add(1, Ordering::Relaxed);
+                write_response_with_headers(
+                    stream,
+                    "429 Too Many Requests",
+                    "text/plain; charset=utf-8",
+                    "too many login attempts",
+                    "Retry-After: 300\r\n",
+                );
+                return;
+            }
             let credentials = match serde_json::from_slice::<AuthRequest>(&request.body) {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     eprintln!("auth login request failed: {error}");
+                    login_limiter.record_failure(peer.ip());
+                    metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                     write_response(stream, "400 Bad Request", "invalid credentials");
                     return;
                 }
             };
             match tasks::login_admin(database_path, &credentials.username, &credentials.password) {
+                Ok(session) => {
+                    login_limiter.record_success(peer.ip());
+                    write_session_response(stream, "200 OK", &session);
+                }
+                Err(_) => {
+                    login_limiter.record_failure(peer.ip());
+                    metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    write_response(stream, "401 Unauthorized", "invalid credentials");
+                }
+            }
+        }
+        ("POST", "/api/auth/password") => {
+            let Some(token) = session_token(&request.headers) else {
+                write_response(stream, "401 Unauthorized", "login required");
+                return;
+            };
+            let authenticated = tasks::authenticate_session(database_path, token)
+                .ok()
+                .flatten()
+                .is_some();
+            if !authenticated {
+                write_response(stream, "401 Unauthorized", "login required");
+                return;
+            }
+            let credentials = match serde_json::from_slice::<PasswordChangeRequest>(&request.body) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    eprintln!("auth password request failed: {error}");
+                    write_response(stream, "400 Bad Request", "invalid password request");
+                    return;
+                }
+            };
+            match tasks::change_password(
+                database_path,
+                token,
+                &credentials.current_password,
+                &credentials.new_password,
+            ) {
                 Ok(session) => write_session_response(stream, "200 OK", &session),
-                Err(_) => write_response(stream, "401 Unauthorized", "invalid credentials"),
+                Err(_) => write_response(stream, "400 Bad Request", "invalid password request"),
             }
         }
         ("POST", "/api/auth/logout") => {
@@ -1468,6 +1706,16 @@ fn write_response_with_type(stream: &mut TcpStream, status: &str, content_type: 
     write_response_with_cookie(stream, status, content_type, body, "");
 }
 
+fn write_response_with_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    headers: &str,
+) {
+    write_response_with_cookie_and_headers(stream, status, content_type, body, "", headers);
+}
+
 fn write_response_with_cookie(
     stream: &mut TcpStream,
     status: &str,
@@ -1475,13 +1723,24 @@ fn write_response_with_cookie(
     body: &str,
     cookie: &str,
 ) {
+    write_response_with_cookie_and_headers(stream, status, content_type, body, cookie, "");
+}
+
+fn write_response_with_cookie_and_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    cookie: &str,
+    headers: &str,
+) {
     let cookie_header = if cookie.is_empty() {
         String::new()
     } else {
         format!("Set-Cookie: {cookie}\r\n")
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{SECURITY_HEADERS}Cache-Control: no-store\r\n{cookie_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{SECURITY_HEADERS}{headers}Cache-Control: no-store\r\n{cookie_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
     );
     let _ = stream.write_all(response.as_bytes());
@@ -1489,13 +1748,32 @@ fn write_response_with_cookie(
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_label, parse_event, verify_event, verify_github_signature, Metrics};
+    use super::{
+        escape_label, parse_event, verify_event, verify_github_signature, LoginLimiter, Metrics,
+    };
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use std::{collections::BTreeMap, sync::atomic::Ordering};
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, Ipv4Addr},
+        sync::atomic::Ordering,
+    };
 
     type HmacSha256 = Hmac<Sha256>;
+
+    #[test]
+    fn limits_repeated_login_failures_per_address() {
+        let limiter = LoginLimiter::default();
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for _ in 0..5 {
+            assert!(limiter.allowed(address));
+            limiter.record_failure(address);
+        }
+        assert!(!limiter.allowed(address));
+        limiter.record_success(address);
+        assert!(limiter.allowed(address));
+    }
 
     #[test]
     fn parses_github_push_and_delete() {

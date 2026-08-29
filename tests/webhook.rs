@@ -153,7 +153,34 @@ fn accepts_signed_github_webhook_over_http() {
     );
     let login_response = http_request(&address, &login_request, login_body);
     assert!(login_response.starts_with("HTTP/1.1 200 OK"));
-    assert!(login_response.contains("Set-Cookie: repo_sync_session="));
+    let login_session = login_response
+        .lines()
+        .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        .and_then(|cookie| cookie.split(';').next())
+        .unwrap()
+        .to_owned();
+
+    let password_body =
+        br#"{"current_password":"correct horse battery staple","new_password":"another correct battery phrase"}"#;
+    let password_request = format!(
+        "POST /api/auth/password HTTP/1.1\r\nHost: localhost\r\nCookie: {login_session}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        password_body.len()
+    );
+    let password_response = http_request(&address, &password_request, password_body);
+    assert!(password_response.starts_with("HTTP/1.1 200 OK"));
+    let changed_session = password_response
+        .lines()
+        .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        .and_then(|cookie| cookie.split(';').next())
+        .unwrap()
+        .to_owned();
+
+    let run_request = format!(
+        "POST /api/tasks/{}/run HTTP/1.1\r\nHost: localhost\r\nCookie: {changed_session}\r\nConnection: close\r\n\r\n",
+        task.id
+    );
+    let run_response = http_request(&address, &run_request, &[]);
+    assert!(run_response.starts_with("HTTP/1.1 202 Accepted"));
 
     let body =
         br#"{"ref":"refs/heads/main","after":"abc","repository":{"full_name":"example/repo"}}"#;

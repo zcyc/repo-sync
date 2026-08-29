@@ -12,5 +12,8 @@ pub use state::{
     status as status_report, webhook_events, StatusReport, WebhookEventStatus, WebhookRefChange,
 };
 pub use sync::{check, sync};
-pub use tasks::{check_task_database, create_task, delete_task, list_tasks, update_task, Task};
+pub use tasks::{
+    backup_task_database, check_task_database, create_task, delete_task, list_tasks, reset_admin,
+    update_task, Task,
+};
 pub use webhook::{retry_event, serve as serve_webhook};

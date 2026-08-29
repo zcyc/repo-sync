@@ -87,14 +87,30 @@
 
   <main id="app" hidden>
   <section>
+    <h2>账号安全</h2>
+    <form id="password-form" class="form-grid">
+      <label for="current-password">当前密码
+        <input id="current-password" name="current-password" type="password" required minlength="12" maxlength="256" autocomplete="current-password">
+      </label>
+      <label for="new-password">新密码
+        <input id="new-password" name="new-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+      </label>
+      <label for="new-password-confirm">确认新密码
+        <input id="new-password-confirm" name="new-password-confirm" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
+      </label>
+      <p class="actions full"><button type="submit">修改密码</button></p>
+    </form>
+  </section>
+
+  <section>
     <div class="actions">
       <h2 style="margin-right:auto">同步任务</h2>
       <button id="new-task" type="button">新建任务</button>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID / 状态</th><th>Workspace</th><th>源仓库</th><th>模式 / 调度</th><th>最近运行</th><th>目标</th><th>Webhook 队列</th><th>操作</th></tr></thead>
-        <tbody id="tasks"><tr><td colspan="8" class="muted">登录后加载任务</td></tr></tbody>
+        <thead><tr><th>ID / 状态</th><th>Workspace</th><th>源仓库</th><th>模式 / 调度</th><th>最近运行</th><th>目标</th><th>Webhook 队列</th><th>最后配置</th><th>操作</th></tr></thead>
+        <tbody id="tasks"><tr><td colspan="9" class="muted">登录后加载任务</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -181,6 +197,7 @@
     const authTitle = document.querySelector('#auth-title');
     const authForm = document.querySelector('#auth-form');
     const authSubmit = document.querySelector('#auth-submit');
+    const passwordForm = document.querySelector('#password-form');
     const passwordConfirmField = document.querySelector('#password-confirm-field');
     const logout = document.querySelector('#logout');
     const app = document.querySelector('#app');
@@ -252,8 +269,10 @@
         const queue = Object.entries(item.queue.counts || {}).map(([key, value]) => `${escapeHtml(key)}=${value}`).join(' · ') || '空';
         const event = item.events[0];
         const state = item.enabled ? '<span class="pill">启用</span>' : '<span class="pill off">停用</span>';
-        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${escapeHtml(run?.status || 'none')}<br><span class="muted">${run?.error ? escapeHtml(run.error) : ''}</span></td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td class="actions"><button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
-      }).join('') : '<tr><td colspan="8" class="muted">没有任务，点击“新建任务”开始</td></tr>';
+        const record = taskRecords.find(value => value.id === item.id);
+        const updated = record ? new Date(record.updated_ms).toLocaleString() : '—';
+        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${escapeHtml(run?.status || 'none')}<br><span class="muted">${run?.error ? escapeHtml(run.error) : ''}</span></td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td>${escapeHtml(updated)}</td><td class="actions"><button data-action="run" data-id="${item.id}" type="button">立即同步</button><button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
+      }).join('') : '<tr><td colspan="9" class="muted">没有任务，点击“新建任务”开始</td></tr>';
     }
 
     function setForm(task) {
@@ -297,6 +316,19 @@
       } catch (error) { message.textContent = `保存失败：${error.message}`; message.className = 'error'; }
     });
 
+    passwordForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const currentPassword = document.querySelector('#current-password').value;
+      const newPassword = document.querySelector('#new-password').value;
+      if (newPassword !== document.querySelector('#new-password-confirm').value) {
+        message.textContent = '两次新密码不一致'; message.className = 'error'; return;
+      }
+      try {
+        await request('/api/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) });
+        passwordForm.reset(); message.textContent = '密码已修改'; message.className = 'muted';
+      } catch (error) { message.textContent = `密码修改失败：${error.message}`; message.className = 'error'; }
+    });
+
     authForm.addEventListener('submit', async event => {
       event.preventDefault();
       const initialized = passwordConfirmField.hidden;
@@ -317,6 +349,10 @@
       const button = event.target.closest('button[data-action]'); if (!button) return;
       const id = Number(button.dataset.id); const task = taskRecords.find(value => value.id === id); if (!task) return;
       try {
+        if (button.dataset.action === 'run') {
+          await request(`/api/tasks/${id}/run`, { method: 'POST' });
+          message.textContent = `任务 #${id} 已加入执行队列`; message.className = 'muted'; await load(); return;
+        }
         if (button.dataset.action === 'edit') { setForm(task); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); return; }
         if (button.dataset.action === 'delete') {
           if (!window.confirm(`删除任务 #${id}？不会删除 workspace 或运行历史。`)) return;
