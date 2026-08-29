@@ -1,0 +1,21 @@
+# 同步主仓库的 main 分支到多个目标仓库。
+[[sync]]
+source = "https://github.com/zcyc/repo-sync.git"
+target = [
+  "https://github.com/zcyc/repo-sync-1.git",
+  "https://github.com/zcyc/repo-sync-2.git",
+]
+workspace = "./repo-sync-main"
+mode = "branch"
+crontab = "0/10 * * * * ? *"
+branch = "main"
+timeout_secs = 300
+
+# 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
+[[sync]]
+source = "https://github.com/zcyc/repo-sync.git"
+target = ["https://github.com/zcyc/repo-sync-3.git"]
+workspace = "./repo-sync-mirror"
+mode = "mirror"
+crontab = "0/10 * * * * ? *"
+timeout_secs = 300
