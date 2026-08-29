@@ -25,6 +25,8 @@ max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
 webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MAIN"]
+webhook_max_pending_events = 10000
+webhook_event_lease_secs = 900
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -49,3 +51,5 @@ max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
 webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MIRROR"]
+webhook_max_pending_events = 10000
+webhook_event_lease_secs = 900

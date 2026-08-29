@@ -104,6 +104,12 @@ struct Args {
     #[clap(long, help = "GitHub webhook secret or GitLab signing/secret token")]
     webhook_secret: Option<String>,
 
+    #[clap(long, help = "maximum pending webhook events per sync item")]
+    webhook_max_pending_events: Option<u64>,
+
+    #[clap(long, help = "lease for a running webhook event in seconds")]
+    webhook_event_lease_secs: Option<u64>,
+
     #[clap(long, help = "show recent webhook event history")]
     events: bool,
 
@@ -158,6 +164,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         json,
         serve: serve_addr,
         webhook_secret,
+        webhook_max_pending_events,
+        webhook_event_lease_secs,
         events,
         retry_event,
         prune_history_days,
@@ -187,8 +195,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if retry_event.is_some() && (check_only || status_only || once || serve_addr.is_some()) {
         return Err("--retry-event cannot be combined with another control command".into());
     }
-    if prune_history_days == Some(0) {
-        return Err("--prune-history-days must be greater than zero".into());
+    if let Some(days) = prune_history_days {
+        if days < 7 {
+            return Err(
+                "--prune-history-days must be at least 7 to preserve webhook deduplication".into(),
+            );
+        }
     }
     if prune_history_days.is_some()
         && (check_only
@@ -261,6 +273,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 failure_cooldown_secs: failure_cooldown_secs
                     .ok_or("--failure-cooldown-secs is required")?,
                 webhook_secret_envs: Vec::new(),
+                webhook_max_pending_events: webhook_max_pending_events
+                    .ok_or("--webhook-max-pending-events is required")?,
+                webhook_event_lease_secs: webhook_event_lease_secs
+                    .ok_or("--webhook-event-lease-secs is required")?,
             }]
         }
         (None, None, Some(file))
@@ -282,7 +298,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && !atomic
                 && max_retries.is_none()
                 && retry_backoff_secs.is_none()
-                && failure_cooldown_secs.is_none() =>
+                && failure_cooldown_secs.is_none()
+                && webhook_max_pending_events.is_none()
+                && webhook_event_lease_secs.is_none() =>
         {
             load(&file)?
         }
@@ -298,6 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if check_only {
         for item in &config {
+            repo_sync::check_state(Path::new(&item.workspace), &item.source)?;
             check(item, check_write)?;
         }
         return Ok(());

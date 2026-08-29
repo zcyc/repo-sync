@@ -27,7 +27,7 @@ fn accepts_signed_github_webhook_over_http() {
     fs::write(
         &config_path,
         format!(
-            "[[sync]]\nsource = \"example/repo\"\ntarget = [\"target\"]\nworkspace = \"{}\"\nmode = \"branch\"\nbranches = [\"main\"]\ninclude_refs = []\nexclude_refs = []\ntimeout_secs = 5\ndry_run = true\nallow_destructive = false\nsync_lfs = false\ndivergence = \"fail\"\ntag_policy = \"preserve\"\nprune_branches = false\nprune_tags = false\natomic = true\nmax_retries = 0\nretry_backoff_secs = 0\nfailure_cooldown_secs = 0\nwebhook_secret_envs = [\"REPO_SYNC_TEST_WEBHOOK_SECRET\"]\n",
+            "[[sync]]\nsource = \"example/repo\"\ntarget = [\"target\"]\nworkspace = \"{}\"\nmode = \"branch\"\nbranches = [\"main\"]\ninclude_refs = []\nexclude_refs = []\ntimeout_secs = 5\ndry_run = true\nallow_destructive = false\nsync_lfs = false\ndivergence = \"fail\"\ntag_policy = \"preserve\"\nprune_branches = false\nprune_tags = false\natomic = true\nmax_retries = 0\nretry_backoff_secs = 0\nfailure_cooldown_secs = 0\nwebhook_secret_envs = [\"REPO_SYNC_TEST_WEBHOOK_SECRET\"]\nwebhook_max_pending_events = 100\nwebhook_event_lease_secs = 60\n",
             workspace.display()
         ),
     )

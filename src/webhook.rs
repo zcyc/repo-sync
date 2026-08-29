@@ -1,6 +1,6 @@
 use crate::{
     config,
-    state::{self, QueuedEvent, StateDb, WebhookRefChange},
+    state::{self, QueuedEvent, StateDb, WebhookEnqueue, WebhookEventInput, WebhookRefChange},
     sync, Item,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -27,7 +27,6 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: u64 = 64;
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
-const EVENT_RECOVERY_MS: i64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 struct WebhookEvent {
@@ -66,6 +65,7 @@ struct Metrics {
     enqueued_events: AtomicU64,
     deduplicated_events: AtomicU64,
     coalesced_events: AtomicU64,
+    queue_full_events: AtomicU64,
     successful_syncs: AtomicU64,
     failed_syncs: AtomicU64,
     sync_duration_ms_total: AtomicU64,
@@ -116,6 +116,12 @@ impl Metrics {
             "repo_sync_webhook_events_coalesced_total",
             "Webhook events coalesced after a successful sync",
             self.coalesced_events.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut output,
+            "repo_sync_webhook_queue_full_total",
+            "Webhook requests rejected because the queue was full",
+            self.queue_full_events.load(Ordering::Relaxed),
         );
         counter(
             &mut output,
@@ -333,7 +339,7 @@ fn prepare_webhook_config(
             };
             let db = StateDb::open(std::path::Path::new(&item.workspace), &item.source)?;
             let now = state::now_ms();
-            db.recover_webhook_events(&item.source, now.saturating_sub(EVENT_RECOVERY_MS), now)?;
+            db.recover_webhook_events(&item.source, now)?;
             Ok(WebhookItem {
                 item: item.clone(),
                 secrets,
@@ -407,7 +413,10 @@ fn process_item(
     let workspace = std::path::Path::new(&item.workspace);
     let mut db = StateDb::open(workspace, &item.source)?;
     loop {
-        let claim = db.claim_webhook_event(&item.source, state::now_ms(), event_id)?;
+        let now = state::now_ms();
+        let lease_ms =
+            i64::try_from(item.webhook_event_lease_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let claim = db.claim_webhook_event(&item.source, now, lease_ms, event_id)?;
         let Some(QueuedEvent {
             event_id: claimed_id,
             attempts,
@@ -531,6 +540,7 @@ fn handle_connection(
     };
     let mut matched = false;
     let mut authenticated = false;
+    let mut queue_full = false;
     for webhook_item in &config {
         if !item_matches(&webhook_item.item, &event) {
             continue;
@@ -546,7 +556,7 @@ fn handle_connection(
         }
         authenticated = true;
         let item = &webhook_item.item;
-        let db = match StateDb::open(std::path::Path::new(&item.workspace), &item.source) {
+        let mut db = match StateDb::open(std::path::Path::new(&item.workspace), &item.source) {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("webhook state open failed: {error}");
@@ -555,19 +565,28 @@ fn handle_connection(
             }
         };
         match db.enqueue_webhook_event(
-            &item.source,
-            event.provider,
-            &event.delivery_id,
-            &event.event_type,
-            &refs_json,
-            state::now_ms(),
+            WebhookEventInput {
+                source: &item.source,
+                provider: event.provider,
+                delivery_id: &event.delivery_id,
+                event_type: &event.event_type,
+                refs_json: &refs_json,
+                received_ms: state::now_ms(),
+            },
+            item.webhook_max_pending_events,
         ) {
-            Ok(true) => {
+            Ok(WebhookEnqueue::Enqueued) => {
                 metrics.enqueued_events.fetch_add(1, Ordering::Relaxed);
                 let _ = wake_sender.send(());
             }
-            Ok(false) => {
+            Ok(WebhookEnqueue::Duplicate) => {
                 metrics.deduplicated_events.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(WebhookEnqueue::Full) => {
+                metrics.queue_full_events.fetch_add(1, Ordering::Relaxed);
+                metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                eprintln!("webhook queue is full for {}", item.workspace);
+                queue_full = true;
             }
             Err(error) => {
                 eprintln!("webhook event enqueue failed: {error}");
@@ -584,6 +603,14 @@ fn handle_connection(
             _ => "invalid webhook signature",
         };
         write_response(&mut stream, "401 Unauthorized", message);
+        return;
+    }
+    if queue_full {
+        write_response(
+            &mut stream,
+            "503 Service Unavailable",
+            "webhook queue is full",
+        );
         return;
     }
     if matched {

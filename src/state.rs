@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -66,6 +66,8 @@ CREATE INDEX IF NOT EXISTS webhook_events_queue_idx
 CREATE INDEX IF NOT EXISTS webhook_events_history_idx
     ON webhook_events(source, received_ms DESC);
 "#;
+const SCHEMA_VERSION: i64 = 1;
+const MIN_WEBHOOK_DEDUP_RETENTION_DAYS: u64 = 7;
 
 pub(crate) struct StateDb {
     connection: Connection,
@@ -144,12 +146,53 @@ pub(crate) struct QueuedEvent {
     pub(crate) attempts: i64,
 }
 
+pub(crate) enum WebhookEnqueue {
+    Enqueued,
+    Duplicate,
+    Full,
+}
+
+pub(crate) struct WebhookEventInput<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) delivery_id: &'a str,
+    pub(crate) event_type: &'a str,
+    pub(crate) refs_json: &'a str,
+    pub(crate) received_ms: i64,
+}
+
 impl StateDb {
     pub(crate) fn open(workspace: &Path, source: &str) -> Result<Self, Box<dyn Error>> {
         let path = database_path(workspace)?;
         let connection = Connection::open(&path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let user_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let has_user_schema: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type IN ('table', 'index', 'view', 'trigger')
+                   AND name NOT LIKE 'sqlite_%'
+             )",
+            [],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        if user_version == 0 && has_user_schema {
+            return Err(
+                "state database has no supported schema version; remove it and resync".into(),
+            );
+        }
+        if user_version != 0 && user_version != SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported state database schema version {user_version}; expected {SCHEMA_VERSION}"
+            )
+            .into());
+        }
         configure(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        if user_version == 0 {
+            connection.execute_batch("PRAGMA user_version = 1;")?;
+        }
         let stored_source: Option<String> = connection
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'source'",
@@ -299,43 +342,70 @@ impl StateDb {
     }
 
     pub(crate) fn enqueue_webhook_event(
-        &self,
-        source: &str,
-        provider: &str,
-        delivery_id: &str,
-        event_type: &str,
-        refs_json: &str,
-        received_ms: i64,
-    ) -> rusqlite::Result<bool> {
-        let changed = self.connection.execute(
+        &mut self,
+        event: WebhookEventInput<'_>,
+        max_pending_events: u64,
+    ) -> rusqlite::Result<WebhookEnqueue> {
+        let max_pending_events = i64::try_from(max_pending_events).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "webhook_max_pending_events is too large",
+            )))
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let duplicate: i64 = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM webhook_events
+                 WHERE source = ?1 AND provider = ?2 AND delivery_id = ?3
+             )",
+            params![event.source, event.provider, event.delivery_id],
+            |row| row.get(0),
+        )?;
+        if duplicate != 0 {
+            transaction.commit()?;
+            return Ok(WebhookEnqueue::Duplicate);
+        }
+        let pending: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM webhook_events
+             WHERE source = ?1 AND status IN ('queued', 'failed', 'running')",
+            [event.source],
+            |row| row.get(0),
+        )?;
+        if pending >= max_pending_events {
+            transaction.commit()?;
+            return Ok(WebhookEnqueue::Full);
+        }
+        transaction.execute(
             "INSERT OR IGNORE INTO webhook_events(
                  source, provider, delivery_id, event_type, refs_json,
                  received_ms, next_attempt_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![
-                source,
-                provider,
-                delivery_id,
-                event_type,
-                refs_json,
-                received_ms
+                event.source,
+                event.provider,
+                event.delivery_id,
+                event.event_type,
+                event.refs_json,
+                event.received_ms
             ],
         )?;
-        Ok(changed == 1)
+        transaction.commit()?;
+        Ok(WebhookEnqueue::Enqueued)
     }
 
     pub(crate) fn recover_webhook_events(
         &self,
         source: &str,
-        stale_before_ms: i64,
         now_ms: i64,
     ) -> rusqlite::Result<usize> {
         self.connection.execute(
             "UPDATE webhook_events
              SET status = 'queued', started_ms = NULL, next_attempt_ms = ?2,
                  last_error = 'worker restarted while event was running'
-             WHERE source = ?1 AND status = 'running' AND started_ms < ?3",
-            params![source, now_ms, stale_before_ms],
+             WHERE source = ?1 AND status = 'running' AND next_attempt_ms <= ?2",
+            params![source, now_ms],
         )
     }
 
@@ -343,9 +413,19 @@ impl StateDb {
         &mut self,
         source: &str,
         now_ms: i64,
+        lease_ms: i64,
         event_id: Option<i64>,
     ) -> rusqlite::Result<Option<QueuedEvent>> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE webhook_events
+             SET status = 'queued', started_ms = NULL, next_attempt_ms = ?2,
+                 last_error = 'worker lease expired'
+             WHERE source = ?1 AND status = 'running' AND next_attempt_ms <= ?2",
+            params![source, now_ms],
+        )?;
         let candidate: Option<(i64, i64)> = match event_id {
             Some(event_id) => transaction
                 .query_row(
@@ -375,9 +455,9 @@ impl StateDb {
         transaction.execute(
             "UPDATE webhook_events
              SET status = 'running', attempts = attempts + 1,
-                 started_ms = ?2, last_error = NULL
+                 started_ms = ?2, next_attempt_ms = ?3, last_error = NULL
              WHERE event_id = ?1 AND status IN ('queued', 'failed')",
-            params![event_id, now_ms],
+            params![event_id, now_ms, now_ms.saturating_add(lease_ms.max(1))],
         )?;
         transaction.commit()?;
         Ok(Some(QueuedEvent {
@@ -485,6 +565,42 @@ impl StateDb {
     }
 }
 
+fn verify_existing_database(connection: &Connection, source: &str) -> Result<(), Box<dyn Error>> {
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported state database schema version {user_version}; expected {SCHEMA_VERSION}"
+        )
+        .into());
+    }
+    let stored_source: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored_source.as_deref() != Some(source) {
+        return Err("state database source does not match configuration source".into());
+    }
+    Ok(())
+}
+
+pub fn check_state(workspace: &Path, source: &str) -> Result<(), Box<dyn Error>> {
+    let path = database_path(workspace)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    verify_existing_database(&connection, source)?;
+    let result: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if result != "ok" {
+        return Err(format!("state database integrity check failed: {result}").into());
+    }
+    Ok(())
+}
+
 pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Error>> {
     let path = database_path(workspace)?;
     let workspace_text = workspace.to_string_lossy().into_owned();
@@ -499,16 +615,7 @@ pub fn status(workspace: &Path, source: &str) -> Result<StatusReport, Box<dyn Er
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    let stored_source: Option<String> = connection
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'source'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if stored_source.as_deref() != Some(source) {
-        return Err("state database source does not match configuration source".into());
-    }
+    verify_existing_database(&connection, source)?;
 
     let latest_run = connection
         .query_row(
@@ -607,16 +714,7 @@ pub fn webhook_events(
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    let stored_source: Option<String> = connection
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'source'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if stored_source.as_deref() != Some(source) {
-        return Err("state database source does not match configuration source".into());
-    }
+    verify_existing_database(&connection, source)?;
     let mut statement = connection.prepare(
         "SELECT event_id, provider, delivery_id, event_type, refs_json,
                 received_ms, status, attempts, next_attempt_ms, started_ms,
@@ -694,16 +792,7 @@ pub(crate) fn webhook_queue_stats(
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    let stored_source: Option<String> = connection
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'source'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if stored_source.as_deref() != Some(source) {
-        return Err("state database source does not match configuration source".into());
-    }
+    verify_existing_database(&connection, source)?;
     let mut statement = connection.prepare(
         "SELECT status, COUNT(*) FROM webhook_events
          WHERE source = ?1 GROUP BY status ORDER BY status",
@@ -744,6 +833,12 @@ pub fn prune_history(
     source: &str,
     older_than_days: u64,
 ) -> Result<usize, Box<dyn Error>> {
+    if older_than_days < MIN_WEBHOOK_DEDUP_RETENTION_DAYS {
+        return Err(format!(
+            "webhook history retention must be at least {MIN_WEBHOOK_DEDUP_RETENTION_DAYS} days"
+        )
+        .into());
+    }
     let path = database_path(workspace)?;
     if !path.exists() {
         return Ok(0);
@@ -809,6 +904,7 @@ pub fn cooldown_active(
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    verify_existing_database(&connection, source)?;
     let cutoff = now_ms().saturating_sub((cooldown_secs.saturating_mul(1000)) as i64);
     for target in targets {
         let row: Option<(i64, i64)> = connection
@@ -858,7 +954,11 @@ fn database_path(workspace: &Path) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_state, prune_history, webhook_events, StateDb, WebhookRefChange};
+    use super::{
+        backup_state, check_state, prune_history, webhook_events, StateDb, WebhookEnqueue,
+        WebhookEventInput, WebhookRefChange,
+    };
+    use rusqlite::Connection;
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -866,6 +966,28 @@ mod tests {
     };
 
     static NEXT_STATE_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn enqueue(
+        db: &mut StateDb,
+        source: &str,
+        delivery_id: &str,
+        refs_json: &str,
+        received_ms: i64,
+        max_pending_events: u64,
+    ) -> WebhookEnqueue {
+        db.enqueue_webhook_event(
+            WebhookEventInput {
+                source,
+                provider: "github",
+                delivery_id,
+                event_type: "push",
+                refs_json,
+                received_ms,
+            },
+            max_pending_events,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn webhook_delivery_is_idempotent_and_retriable() {
@@ -886,17 +1008,27 @@ mod tests {
         }])
         .unwrap();
         let mut db = StateDb::open(&workspace, source).unwrap();
-        assert!(db
-            .enqueue_webhook_event(source, "github", "delivery-1", "push", &refs, 1)
-            .unwrap());
-        assert!(!db
-            .enqueue_webhook_event(source, "github", "delivery-1", "push", &refs, 1)
-            .unwrap());
-        assert!(db
-            .enqueue_webhook_event(source, "github", "delivery-2", "push", &refs, 1)
-            .unwrap());
+        assert!(matches!(
+            enqueue(&mut db, source, "delivery-1", &refs, 1, 100),
+            WebhookEnqueue::Enqueued
+        ));
+        assert!(matches!(
+            enqueue(&mut db, source, "delivery-1", &refs, 1, 100),
+            WebhookEnqueue::Duplicate
+        ));
+        assert!(matches!(
+            enqueue(&mut db, source, "delivery-full", &refs, 1, 1),
+            WebhookEnqueue::Full
+        ));
+        assert!(matches!(
+            enqueue(&mut db, source, "delivery-2", &refs, 1, 100),
+            WebhookEnqueue::Enqueued
+        ));
         let now = super::now_ms();
-        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        let claimed = db
+            .claim_webhook_event(source, now, 1_000, None)
+            .unwrap()
+            .unwrap();
         db.finish_webhook_event(
             claimed.event_id,
             claimed.attempts,
@@ -912,7 +1044,7 @@ mod tests {
         assert!(db.retry_webhook_event(source, claimed.event_id).unwrap());
         let retry_now = super::now_ms();
         let claimed = db
-            .claim_webhook_event(source, retry_now, Some(claimed.event_id))
+            .claim_webhook_event(source, retry_now, 1_000, Some(claimed.event_id))
             .unwrap()
             .unwrap();
         db.finish_webhook_event(
@@ -930,6 +1062,7 @@ mod tests {
             1
         );
         drop(db);
+        assert!(check_state(&workspace, source).is_ok());
 
         let history = webhook_events(&workspace, source, 10).unwrap();
         assert_eq!(history.len(), 2);
@@ -963,25 +1096,35 @@ mod tests {
         let workspace = root.join("workspace");
         let source = "https://github.com/example/source.git";
         let mut db = StateDb::open(&workspace, source).unwrap();
-        assert!(db
-            .enqueue_webhook_event(source, "github", "old-success", "push", "[]", 1)
-            .unwrap());
+        assert!(matches!(
+            enqueue(&mut db, source, "old-success", "[]", 1, 100),
+            WebhookEnqueue::Enqueued
+        ));
         let now = super::now_ms();
-        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        let claimed = db
+            .claim_webhook_event(source, now, 1_000, None)
+            .unwrap()
+            .unwrap();
         db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, None, 2, 2)
             .unwrap();
-        assert!(db
-            .enqueue_webhook_event(source, "github", "old-dead", "push", "[]", 1)
-            .unwrap());
-        let claimed = db.claim_webhook_event(source, now, None).unwrap().unwrap();
+        assert!(matches!(
+            enqueue(&mut db, source, "old-dead", "[]", 1, 100),
+            WebhookEnqueue::Enqueued
+        ));
+        let claimed = db
+            .claim_webhook_event(source, now, 1_000, None)
+            .unwrap()
+            .unwrap();
         db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, Some("failed"), 2, 2)
             .unwrap();
-        assert!(db
-            .enqueue_webhook_event(source, "github", "pending", "push", "[]", now)
-            .unwrap());
+        assert!(matches!(
+            enqueue(&mut db, source, "pending", "[]", now, 100),
+            WebhookEnqueue::Enqueued
+        ));
         drop(db);
 
-        assert_eq!(prune_history(&workspace, source, 1).unwrap(), 2);
+        assert!(prune_history(&workspace, source, 1).is_err());
+        assert_eq!(prune_history(&workspace, source, 7).unwrap(), 2);
         assert_eq!(webhook_events(&workspace, source, 10).unwrap().len(), 1);
         let backup = root.join("backup.sqlite3");
         backup_state(&workspace, source, &backup).unwrap();
@@ -993,6 +1136,66 @@ mod tests {
         let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(backup);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_webhook_lease_is_requeued() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let workspace = std::env::temp_dir().join(format!(
+            "repo-sync-lease-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = "https://github.com/example/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(matches!(
+            enqueue(&mut db, source, "lease-1", "[]", 1, 10),
+            WebhookEnqueue::Enqueued
+        ));
+        let now = super::now_ms();
+        let claimed = db
+            .claim_webhook_event(source, now, 10, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.recover_webhook_events(source, now + 11).unwrap(), 1);
+        let reclaimed = db
+            .claim_webhook_event(source, now + 11, 10, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.event_id, claimed.event_id);
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn rejects_unversioned_state_database() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-schema-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(connection);
+        assert!(StateDb::open(&workspace, "source").is_err());
+        assert!(check_state(&workspace, "source").is_err());
+        let _ = fs::remove_file(database);
         let _ = fs::remove_dir_all(root);
     }
 }

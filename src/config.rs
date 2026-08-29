@@ -31,6 +31,8 @@ pub struct Item {
     pub retry_backoff_secs: u64,
     pub failure_cooldown_secs: u64,
     pub webhook_secret_envs: Vec<String>,
+    pub webhook_max_pending_events: u64,
+    pub webhook_event_lease_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
@@ -105,6 +107,12 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     }
     if item.max_retries > 10 {
         return Err("max_retries cannot be greater than 10".into());
+    }
+    if item.webhook_max_pending_events == 0 {
+        return Err("webhook_max_pending_events must be greater than zero".into());
+    }
+    if item.webhook_event_lease_secs == 0 {
+        return Err("webhook_event_lease_secs must be greater than zero".into());
     }
     if item.branches.iter().any(|branch| branch.trim().is_empty()) {
         return Err("branches cannot contain empty patterns".into());
@@ -241,6 +249,8 @@ mod tests {
             retry_backoff_secs: 5,
             failure_cooldown_secs: 60,
             webhook_secret_envs: Vec::new(),
+            webhook_max_pending_events: 10_000,
+            webhook_event_lease_secs: 900,
         }
     }
 

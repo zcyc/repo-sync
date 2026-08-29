@@ -27,6 +27,10 @@ OPTIONS:
         --serve <ADDR>          listen for GitHub/GitLab webhook POST triggers
         --webhook-secret <SECRET>
                                 GitHub secret or GitLab signing/secret token
+        --webhook-max-pending-events <N>
+                                maximum pending webhook events per sync item
+        --webhook-event-lease-secs <N>
+                                lease for a running webhook event in seconds
         --events                show recent webhook event history
         --retry-event <ID>      retry a failed or dead webhook event
         --prune-history-days <DAYS>
@@ -91,6 +95,8 @@ max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
 webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MAIN"]
+webhook_max_pending_events = 10000
+webhook_event_lease_secs = 900
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -115,6 +121,8 @@ max_retries = 3
 retry_backoff_secs = 5
 failure_cooldown_secs = 60
 webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MIRROR"]
+webhook_max_pending_events = 10000
+webhook_event_lease_secs = 900
 ```
 
 - `source`: The source repository URL
@@ -138,6 +146,8 @@ webhook_secret_envs = ["REPO_SYNC_WEBHOOK_SECRET_MIRROR"]
 - `retry_backoff_secs`: Initial exponential backoff between attempts.
 - `failure_cooldown_secs`: When greater than zero, scheduled runs pause while every target is repeatedly failing; manual `--once` runs are not suppressed.
 - `webhook_secret_envs`: Environment variable names containing the webhook secret. Multiple names allow secret rotation; keep the current and previous secret during the overlap.
+- `webhook_max_pending_events`: Maximum number of queued, failed, or running webhook events for this item. A full queue returns `503` so the provider retries later.
+- `webhook_event_lease_secs`: Visibility lease for a running event. An expired lease is returned to the queue after a worker crash; set it longer than the longest expected sync.
 - A `<workspace-name>.sqlite3` database is written next to the workspace with target state, run history, errors, durations, synced ref SHAs, webhook delivery ids, queue state, and dead-letter events. It uses SQLite WAL mode and a busy timeout for safe local readers.
 
 `mirror` mode uses `git clone --mirror`, fetches all refs, and builds an explicit
@@ -181,8 +191,9 @@ one successful full-state sync coalesces the redundant queued deliveries. Event
 IDs are local to each workspace; pass `--workspace <PATH>` with
 `--retry-event <ID>` when the ID exists in more than one workspace.
 `--prune-history-days N` explicitly removes finished run and webhook history
-older than `N` days; `--backup-state PATH` creates a non-overwriting SQLite
-backup. Neither maintenance command runs automatically.
+older than `N` days; `N` must be at least 7 so provider delivery IDs remain
+deduplicated across normal redeliveries. `--backup-state PATH` creates a
+non-overwriting SQLite backup. Neither maintenance command runs automatically.
 
 `atomic` applies to one Git ref push for one target. Multiple targets, LFS
 transfers, and the SQLite status update are separate operations and are not one
@@ -197,6 +208,10 @@ intentionally breaking: existing items must add `workspace`, `mode`,
 `tag_policy`, `prune_branches`, `prune_tags`, `atomic`, `max_retries`,
 `retry_backoff_secs`, `failure_cooldown_secs`, `include_refs`,
 `exclude_refs`, `webhook_secret_envs`, and replace `branch` with `branches`.
+New items must also define `webhook_max_pending_events` and
+`webhook_event_lease_secs`.
+SQLite databases without the current schema version are rejected and must be
+removed and rebuilt; no state migration is provided.
 File-based webhook serving no longer reads the old global
 `REPO_SYNC_WEBHOOK_SECRET`; direct mode requires the explicit
 `--webhook-secret`. Previous TOML state files and the old generic

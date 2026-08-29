@@ -77,6 +77,8 @@ fn item(source: &Path, target: &Path, workspace: &Path) -> Item {
         retry_backoff_secs: 0,
         failure_cooldown_secs: 0,
         webhook_secret_envs: Vec::new(),
+        webhook_max_pending_events: 10_000,
+        webhook_event_lease_secs: 900,
     }
 }
 
