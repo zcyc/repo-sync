@@ -8,8 +8,19 @@ target = [
 workspace = "./repo-sync-main"
 mode = "branch"
 crontab = "0/10 * * * * ? *"
-branch = "main"
+# 空数组表示同步 source 的全部分支；也可以写 ["main", "release/*"]。
+branches = []
 timeout_secs = 300
+dry_run = false
+allow_destructive = false
+sync_lfs = false
+divergence = "fail"
+tag_policy = "preserve"
+prune_branches = false
+prune_tags = false
+atomic = true
+max_retries = 3
+retry_backoff_secs = 5
 
 # 镜像模式会同步全部 refs，可能强制更新或删除目标仓库中的 refs。
 [[sync]]
@@ -18,4 +29,15 @@ target = ["https://github.com/zcyc/repo-sync-3.git"]
 workspace = "./repo-sync-mirror"
 mode = "mirror"
 crontab = "0/10 * * * * ? *"
+branches = []
 timeout_secs = 300
+dry_run = true
+allow_destructive = false
+sync_lfs = false
+divergence = "force"
+tag_policy = "force"
+prune_branches = false
+prune_tags = false
+atomic = true
+max_retries = 3
+retry_backoff_secs = 5
