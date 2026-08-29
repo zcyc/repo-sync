@@ -1,6 +1,6 @@
 use crate::{
     config, dashboard, git,
-    state::{self, QueuedEvent, StateDb, WebhookEnqueue, WebhookEventInput, WebhookRefChange},
+    state::{self, StateDb, WebhookEnqueue, WebhookEventInput, WebhookRefChange},
     sync,
     tasks::{self, Task},
     Item,
@@ -741,18 +741,53 @@ fn process_item(
         let lease_ms =
             i64::try_from(item.webhook_event_lease_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
         let claim = db.claim_webhook_event(&item.source, now, lease_ms, event_id)?;
-        let Some(QueuedEvent {
-            event_id: claimed_id,
-            attempts,
-        }) = claim
-        else {
+        let Some(claimed) = claim else {
             return Ok(());
         };
+        let claimed_id = claimed.event_id;
+        let attempts = claimed.attempts;
         if !db.webhook_event_is_running(claimed_id)? {
             continue;
         }
+        let heartbeat_interval_ms = (lease_ms / 3).clamp(100, 60_000);
+        let (stop_heartbeat, heartbeat_stop) = mpsc::channel();
+        let heartbeat_workspace = workspace.to_path_buf();
+        let heartbeat_source = item.source.clone();
+        let heartbeat_token = claimed.lease_token.clone();
+        let heartbeat = thread::spawn(move || {
+            let Ok(heartbeat_db) = StateDb::open(&heartbeat_workspace, &heartbeat_source) else {
+                eprintln!("failed to open state database for webhook lease heartbeat");
+                return;
+            };
+            let interval =
+                Duration::from_millis(u64::try_from(heartbeat_interval_ms).unwrap_or(100));
+            loop {
+                match heartbeat_stop.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let lease_until = state::now_ms().saturating_add(lease_ms.max(1));
+                        match heartbeat_db.renew_webhook_event(
+                            claimed_id,
+                            &heartbeat_token,
+                            lease_until,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => {
+                                eprintln!(
+                                    "failed to renew webhook event {claimed_id} lease: {error}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
         let started = Instant::now();
         let result = sync::sync(item);
+        let _ = stop_heartbeat.send(());
+        let _ = heartbeat.join();
         let error = result.as_ref().err().map(ToString::to_string);
         if let Some(metrics) = metrics {
             record_sync_metrics(metrics, started, &result);
@@ -760,8 +795,7 @@ fn process_item(
         let retry_after =
             state::now_ms().saturating_add(event_retry_delay(item.retry_backoff_secs, attempts));
         let finished = db.finish_webhook_event(
-            claimed_id,
-            attempts,
+            &claimed,
             i64::from(item.max_retries) + 1,
             error.as_deref(),
             state::now_ms(),
@@ -1798,7 +1832,12 @@ fn repository_keys(value: &str) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some((_, rest)) = value.split_once("://") {
         let mut parts = rest.splitn(2, '/');
-        let host = parts.next().unwrap_or_default();
+        let host = parts
+            .next()
+            .unwrap_or_default()
+            .rsplit('@')
+            .next()
+            .unwrap_or_default();
         let path = parts.next().unwrap_or_default();
         if !host.is_empty() && !path.is_empty() {
             keys.push(format!("{host}/{path}"));
@@ -2218,6 +2257,10 @@ mod tests {
         assert_eq!(
             super::repository_keys("git@gitlab.com:org/repo.git"),
             vec!["gitlab.com/org/repo"]
+        );
+        assert_eq!(
+            super::repository_keys("ssh://git@github.com/org/repo.git"),
+            vec!["github.com/org/repo"]
         );
         assert_ne!(
             super::repository_keys("https://github.com/org/repo.git"),

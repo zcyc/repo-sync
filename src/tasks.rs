@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     error::Error,
     io,
     path::Path,
@@ -118,10 +119,18 @@ impl TaskDb {
             ))
         })?;
         let mut tasks = Vec::new();
+        let mut workspaces = HashSet::new();
         for row in rows {
             let (id, enabled, config_json, created_ms, updated_ms) = row?;
             let item: Item = serde_json::from_str(&config_json)?;
             validate_item(&item)?;
+            if !workspaces.insert(config::workspace_identity(Path::new(&item.workspace))?) {
+                return Err(format!(
+                    "workspace resolves to duplicate task workspace: {}",
+                    item.workspace
+                )
+                .into());
+            }
             tasks.push(Task {
                 id,
                 enabled,
@@ -672,6 +681,21 @@ mod tests {
         assert!(db
             .update(second.id, &item(alias_workspace.to_str().unwrap()), true)
             .is_err());
+
+        let legacy_alias = item(alias_workspace.to_str().unwrap());
+        db.connection
+            .execute(
+                "INSERT INTO tasks(enabled, source, workspace, config_json, created_ms, updated_ms)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![
+                    legacy_alias.source,
+                    legacy_alias.workspace,
+                    serde_json::to_string(&legacy_alias).unwrap(),
+                    super::now_ms()
+                ],
+            )
+            .unwrap();
+        assert!(db.list().is_err());
 
         drop(db);
         let _ = fs::remove_dir_all(root);

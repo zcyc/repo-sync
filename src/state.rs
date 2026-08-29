@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_ms INTEGER NOT NULL,
     started_ms INTEGER,
+    lease_token TEXT,
     finished_ms INTEGER,
     last_error TEXT,
     UNIQUE(source, provider, delivery_id)
@@ -67,7 +68,7 @@ CREATE INDEX IF NOT EXISTS webhook_events_queue_idx
 CREATE INDEX IF NOT EXISTS webhook_events_history_idx
     ON webhook_events(source, received_ms DESC);
 "#;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MIN_WEBHOOK_DEDUP_RETENTION_DAYS: u64 = 7;
 
 pub(crate) struct StateDb {
@@ -146,6 +147,7 @@ pub struct WebhookRefChange {
 pub(crate) struct QueuedEvent {
     pub(crate) event_id: i64,
     pub(crate) attempts: i64,
+    pub(crate) lease_token: String,
 }
 
 pub(crate) enum WebhookEnqueue {
@@ -193,7 +195,7 @@ impl StateDb {
         configure(&connection)?;
         connection.execute_batch(SCHEMA)?;
         if user_version == 0 {
-            connection.execute_batch("PRAGMA user_version = 1;")?;
+            connection.execute_batch("PRAGMA user_version = 2;")?;
         }
         let stored_source: Option<String> = connection
             .query_row(
@@ -465,7 +467,7 @@ impl StateDb {
         transaction.execute(
             "UPDATE webhook_events
              SET status = 'queued', started_ms = NULL, next_attempt_ms = ?2,
-                 last_error = 'worker lease expired'
+                 lease_token = NULL, last_error = 'worker lease expired'
              WHERE source = ?1 AND status = 'running' AND next_attempt_ms <= ?2",
             params![source, now_ms],
         )?;
@@ -495,24 +497,31 @@ impl StateDb {
             transaction.commit()?;
             return Ok(None);
         };
+        let lease_token = Uuid::new_v4().to_string();
         transaction.execute(
             "UPDATE webhook_events
              SET status = 'running', attempts = attempts + 1,
-                 started_ms = ?2, next_attempt_ms = ?3, last_error = NULL
+                 started_ms = ?2, next_attempt_ms = ?3, lease_token = ?4,
+                 last_error = NULL
              WHERE event_id = ?1 AND status IN ('queued', 'failed')",
-            params![event_id, now_ms, now_ms.saturating_add(lease_ms.max(1))],
+            params![
+                event_id,
+                now_ms,
+                now_ms.saturating_add(lease_ms.max(1)),
+                lease_token
+            ],
         )?;
         transaction.commit()?;
         Ok(Some(QueuedEvent {
             event_id,
             attempts: attempts + 1,
+            lease_token,
         }))
     }
 
     pub(crate) fn finish_webhook_event(
         &self,
-        event_id: i64,
-        attempts: i64,
+        event: &QueuedEvent,
         max_attempts: i64,
         error: Option<&str>,
         finished_ms: i64,
@@ -523,23 +532,41 @@ impl StateDb {
             ("cancelled", finished_ms)
         } else if error.is_none() {
             ("succeeded", finished_ms)
-        } else if attempts >= max_attempts {
+        } else if event.attempts >= max_attempts {
             ("dead", finished_ms)
         } else {
             ("failed", retry_after_ms)
         };
         let changed = self.connection.execute(
             "UPDATE webhook_events
-             SET status = ?2, finished_ms = ?3, next_attempt_ms = ?4, last_error = ?5
-             WHERE event_id = ?1 AND status = 'running' AND attempts = ?6",
+             SET status = ?2, finished_ms = ?3, next_attempt_ms = ?4,
+                 lease_token = NULL, last_error = ?5
+             WHERE event_id = ?1 AND status = 'running' AND attempts = ?6
+               AND lease_token = ?7",
             params![
-                event_id,
+                event.event_id,
                 status,
                 finished_ms,
                 next_attempt_ms,
                 error,
-                attempts
+                event.attempts,
+                event.lease_token
             ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn renew_webhook_event(
+        &self,
+        event_id: i64,
+        lease_token: &str,
+        lease_until_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE webhook_events
+             SET next_attempt_ms = ?3
+             WHERE event_id = ?1 AND status = 'running' AND lease_token = ?2",
+            params![event_id, lease_token, lease_until_ms],
         )?;
         Ok(changed == 1)
     }
@@ -560,7 +587,7 @@ impl StateDb {
         self.connection.execute(
             "UPDATE webhook_events
              SET status = 'cancelled', finished_ms = ?2, next_attempt_ms = ?2,
-                 last_error = 'cancelled by operator'
+                 lease_token = NULL, last_error = 'cancelled by operator'
              WHERE source = ?1 AND status IN ('queued', 'failed', 'running')",
             params![source, now_ms()],
         )
@@ -574,7 +601,8 @@ impl StateDb {
         let changed = self.connection.execute(
             "UPDATE webhook_events
              SET status = 'queued', attempts = 0, next_attempt_ms = ?3,
-                 started_ms = NULL, finished_ms = NULL, last_error = NULL
+                 started_ms = NULL, lease_token = NULL, finished_ms = NULL,
+                 last_error = NULL
              WHERE source = ?1 AND event_id = ?2 AND status IN ('failed', 'dead')",
             params![source, event_id, now_ms()],
         )?;
@@ -1135,15 +1163,8 @@ mod tests {
             .claim_webhook_event(source, now, 1_000, None)
             .unwrap()
             .unwrap();
-        db.finish_webhook_event(
-            claimed.event_id,
-            claimed.attempts,
-            1,
-            Some("failed"),
-            now + 1,
-            now + 1,
-        )
-        .unwrap();
+        db.finish_webhook_event(&claimed, 1, Some("failed"), now + 1, now + 1)
+            .unwrap();
         assert!(db
             .has_retryable_webhook_event(source, claimed.event_id)
             .unwrap());
@@ -1153,15 +1174,8 @@ mod tests {
             .claim_webhook_event(source, retry_now, 1_000, Some(claimed.event_id))
             .unwrap()
             .unwrap();
-        db.finish_webhook_event(
-            claimed.event_id,
-            claimed.attempts,
-            1,
-            None,
-            retry_now + 1,
-            retry_now + 1,
-        )
-        .unwrap();
+        db.finish_webhook_event(&claimed, 1, None, retry_now + 1, retry_now + 1)
+            .unwrap();
         assert_eq!(
             db.coalesce_webhook_events(source, claimed.event_id, retry_now + 1)
                 .unwrap(),
@@ -1252,8 +1266,7 @@ mod tests {
             .claim_webhook_event(source, now, 1_000, None)
             .unwrap()
             .unwrap();
-        db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, None, 2, 2)
-            .unwrap();
+        db.finish_webhook_event(&claimed, 1, None, 2, 2).unwrap();
         assert!(matches!(
             enqueue(&mut db, source, "old-dead", "[]", 1, 100),
             WebhookEnqueue::Enqueued
@@ -1262,7 +1275,7 @@ mod tests {
             .claim_webhook_event(source, now, 1_000, None)
             .unwrap()
             .unwrap();
-        db.finish_webhook_event(claimed.event_id, claimed.attempts, 1, Some("failed"), 2, 2)
+        db.finish_webhook_event(&claimed, 1, Some("failed"), 2, 2)
             .unwrap();
         assert!(matches!(
             enqueue(&mut db, source, "old-cancelled", "[]", 1, 100),
@@ -1272,15 +1285,8 @@ mod tests {
             .claim_webhook_event(source, now, 1_000, None)
             .unwrap()
             .unwrap();
-        db.finish_webhook_event(
-            claimed.event_id,
-            claimed.attempts,
-            1,
-            Some("sync cancelled"),
-            2,
-            2,
-        )
-        .unwrap();
+        db.finish_webhook_event(&claimed, 1, Some("sync cancelled"), 2, 2)
+            .unwrap();
         assert!(matches!(
             enqueue(&mut db, source, "pending", "[]", now, 100),
             WebhookEnqueue::Enqueued
@@ -1338,6 +1344,46 @@ mod tests {
     }
 
     #[test]
+    fn webhook_lease_renewal_requires_current_owner() {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-lease-renewal-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        let source = "https://github.com/example/source.git";
+        let mut db = StateDb::open(&workspace, source).unwrap();
+        assert!(matches!(
+            enqueue(&mut db, source, "lease-renewal", "[]", 1, 10),
+            WebhookEnqueue::Enqueued
+        ));
+        let now = super::now_ms();
+        let claimed = db
+            .claim_webhook_event(source, now, 10, None)
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .renew_webhook_event(claimed.event_id, &claimed.lease_token, now + 5_000)
+            .unwrap());
+        assert!(!db
+            .renew_webhook_event(claimed.event_id, "stale-owner", now + 10_000)
+            .unwrap());
+        let events = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(events[0].next_attempt_ms, now + 5_000);
+
+        let database = workspace.with_file_name("workspace.sqlite3");
+        let _ = fs::remove_file(&database);
+        let _ = fs::remove_file(database.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(database.with_extension("sqlite3-shm"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stale_webhook_lease_owner_cannot_finish_event() {
         let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1369,14 +1415,31 @@ mod tests {
         assert_eq!(first.event_id, second.event_id);
         assert!(second.attempts > first.attempts);
 
-        db.finish_webhook_event(first.event_id, first.attempts, 1, None, now + 3, now + 3)
-            .unwrap();
+        assert!(!db
+            .finish_webhook_event(&first, 1, None, now + 3, now + 3,)
+            .unwrap());
         let events = webhook_events(&workspace, source, 10).unwrap();
         assert_eq!(events[0].status, "running");
         assert_eq!(events[0].attempts, second.attempts);
 
-        db.finish_webhook_event(second.event_id, second.attempts, 1, None, now + 4, now + 4)
+        assert!(db
+            .finish_webhook_event(&second, 10, Some("failed"), now + 4, now + 4)
+            .unwrap());
+        assert!(db.retry_webhook_event(source, second.event_id).unwrap());
+        let third = db
+            .claim_webhook_event(source, now + 5, 1_000, None)
+            .unwrap()
             .unwrap();
+        assert_eq!(third.event_id, first.event_id);
+        assert!(!db
+            .finish_webhook_event(&first, 10, None, now + 6, now + 6,)
+            .unwrap());
+        let events = webhook_events(&workspace, source, 10).unwrap();
+        assert_eq!(events[0].status, "running");
+
+        assert!(db
+            .finish_webhook_event(&third, 10, None, now + 7, now + 7,)
+            .unwrap());
         drop(db);
         let events = webhook_events(&workspace, source, 10).unwrap();
         assert_eq!(events[0].status, "succeeded");

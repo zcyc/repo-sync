@@ -368,17 +368,17 @@
 
     authForm.addEventListener('submit', async event => {
       event.preventDefault();
-      const initialized = passwordConfirmField.hidden;
+      const setup = !passwordConfirmField.hidden;
       const password = document.querySelector('#password').value;
-      if (!initialized && password !== document.querySelector('#password-confirm').value) {
+      if (setup && password !== document.querySelector('#password-confirm').value) {
         message.textContent = '两次密码不一致'; message.className = 'error'; return;
       }
       authSubmit.disabled = true;
       try {
-        await request(initialized ? '/api/auth/setup' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password }) });
+        await request(setup ? '/api/auth/setup' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password }) });
         document.querySelector('#password').value = ''; document.querySelector('#password-confirm').value = '';
         message.textContent = '登录成功'; message.className = 'muted'; await load();
-      } catch (error) { message.textContent = `${initialized ? '设置失败' : '登录失败'}：${error.message}`; message.className = 'error'; }
+      } catch (error) { message.textContent = `${setup ? '设置失败' : '登录失败'}：${error.message}`; message.className = 'error'; }
       finally { authSubmit.disabled = false; }
     });
 
