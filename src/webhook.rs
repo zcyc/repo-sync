@@ -570,36 +570,6 @@ fn register_reload_flag() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
     Ok(flag)
 }
 
-pub fn retry_event(
-    config: &[Item],
-    event_id: i64,
-    selected_workspace: Option<&str>,
-) -> Result<bool, Box<dyn Error>> {
-    let mut candidate = None;
-    for item in config {
-        if selected_workspace.is_some_and(|workspace| workspace != item.workspace) {
-            continue;
-        }
-        let workspace = std::path::Path::new(&item.workspace);
-        if !state::has_retryable_webhook_event(workspace, &item.source, event_id)? {
-            continue;
-        }
-        if candidate.is_some() {
-            return Err("webhook event id is ambiguous; pass --workspace".into());
-        }
-        candidate = Some(item);
-    }
-    let Some(item) = candidate else {
-        return Ok(false);
-    };
-    let workspace = std::path::Path::new(&item.workspace);
-    if state::retry_webhook_event(workspace, &item.source, event_id)? {
-        process_item(item, Some(event_id), None)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 fn worker_loop(
     config: Arc<RwLock<Vec<WebhookItem>>>,
     wake_receiver: Receiver<WorkerCommand>,

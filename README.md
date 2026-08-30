@@ -9,8 +9,7 @@
 | 场景 | 推荐方式 |
 | --- | --- |
 | 长期运行、管理多个任务 | `--serve` + Web 管理页面 |
-| 手动执行一次同步 | Web 页面中的“立即同步” |
-| 一次执行任务数据库里的所有任务 | `--once` |
+| 手动执行任务 | Web 页面中的“立即同步” |
 | 查看状态或维护 SQLite | `--status`、`--events`、`--backup-*` 等维护命令 |
 
 任务配置只存 SQLite，不读取 `config.toml`、JSON 或 TOML 配置文件。
@@ -128,7 +127,7 @@ Web 表单已经提供安全的常用默认值：
 
 ## 任务数据库模式
 
-CLI 不再接收 source、target 或任何同步配置参数。所有任务只能在 Web 页面创建和修改；CLI 只负责启动服务、执行已保存任务和维护数据库。
+CLI 不再接收 source、target 或任何同步配置参数，也不执行同步任务。所有任务只能在 Web 页面创建、修改和手动执行；CLI 只负责启动服务和维护数据库。
 
 使用 `--serve` 时，任务来自 `--database`：
 
@@ -141,7 +140,7 @@ repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --serve 127.0.0.1:8080
 - 没有 `crontab`：等待 Webhook 或页面上的“立即同步”。
 - 有 `crontab`：按计划自动入队。
 - 页面上的“立即同步”、取消、重试和启停会立即生效。
-- `--once`：把当前数据库中启用的任务各执行一次，然后退出。
+- CLI 启动时不会自动执行任务；定时任务和 Webhook 由 `--serve` 后台处理。
 
 任务数据库和 workspace 状态库是分开的：
 
@@ -199,10 +198,6 @@ repo-sync --database ./repo-sync-tasks.sqlite3 --status --json
 # 每个 workspace 最近 50 条 Webhook 事件
 repo-sync --database ./repo-sync-tasks.sqlite3 --events
 repo-sync --database ./repo-sync-tasks.sqlite3 --events --json
-
-# 重试失败或 dead 事件；ID 跨多个 workspace 重复时加 --workspace
-repo-sync --database ./repo-sync-tasks.sqlite3 --retry-event 42
-repo-sync --database ./repo-sync-tasks.sqlite3 --workspace ./source-workspace --retry-event 42
 
 # 只删除已结束且超过 30 天的历史；最小值为 7
 repo-sync --database ./repo-sync-tasks.sqlite3 --prune-history-days 30

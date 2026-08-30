@@ -17,4 +17,4 @@ pub use tasks::{
     backup_task_database, check_task_database, create_task, delete_task, list_tasks, reset_admin,
     update_task, Task,
 };
-pub use webhook::{retry_event, serve as serve_webhook};
+pub use webhook::serve as serve_webhook;

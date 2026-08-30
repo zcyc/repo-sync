@@ -632,22 +632,6 @@ impl StateDb {
         Ok(changed == 1)
     }
 
-    pub(crate) fn has_retryable_webhook_event(
-        &self,
-        source: &str,
-        event_id: i64,
-    ) -> rusqlite::Result<bool> {
-        let exists: i64 = self.connection.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM webhook_events
-                 WHERE source = ?1 AND event_id = ?2 AND status IN ('failed', 'dead')
-             )",
-            params![source, event_id],
-            |row| row.get(0),
-        )?;
-        Ok(exists != 0)
-    }
-
     pub(crate) fn coalesce_webhook_events(
         &self,
         source: &str,
@@ -1030,19 +1014,6 @@ pub fn backup_state(
     Ok(())
 }
 
-pub(crate) fn has_retryable_webhook_event(
-    workspace: &Path,
-    source: &str,
-    event_id: i64,
-) -> Result<bool, Box<dyn Error>> {
-    let path = database_path(workspace)?;
-    if !path.exists() {
-        return Ok(false);
-    }
-    let db = StateDb::open(workspace, source)?;
-    Ok(db.has_retryable_webhook_event(source, event_id)?)
-}
-
 pub fn cooldown_active(
     workspace: &Path,
     source: &str,
@@ -1192,9 +1163,6 @@ mod tests {
             .unwrap();
         db.finish_webhook_event(&claimed, 1, Some("failed"), now + 1, now + 1)
             .unwrap();
-        assert!(db
-            .has_retryable_webhook_event(source, claimed.event_id)
-            .unwrap());
         assert!(db.retry_webhook_event(source, claimed.event_id).unwrap());
         let retry_now = super::now_ms();
         let claimed = db

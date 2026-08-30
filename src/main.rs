@@ -1,18 +1,9 @@
 use clap::Parser;
-use job_scheduler_ng::{Job, JobScheduler};
 use repo_sync::{
-    backup_task_database, check, check_task_database, cooldown_active, list_tasks,
-    retry_event as retry_webhook, serve_webhook, status_report, sync, webhook_events, Item,
+    backup_task_database, check, check_task_database, list_tasks, serve_webhook, status_report,
+    webhook_events,
 };
-use std::{
-    error::Error,
-    path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{error::Error, path::Path};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -49,9 +40,6 @@ struct Args {
     #[clap(long, help = "show recent webhook event history")]
     events: bool,
 
-    #[clap(long, help = "retry a dead or failed webhook event by event id")]
-    retry_event: Option<i64>,
-
     #[clap(
         long,
         value_name = "DAYS",
@@ -74,9 +62,6 @@ struct Args {
         help = "remove the administrator account and require first-use setup"
     )]
     reset_admin: bool,
-
-    #[clap(long, help = "run scheduled items once and exit")]
-    once: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -89,42 +74,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         json,
         serve: serve_addr,
         events,
-        retry_event,
         prune_history_days,
         backup_state,
         backup_tasks,
         reset_admin,
-        once,
     } = Args::parse();
-    let retry_workspace = workspace.clone();
     let database_path = Path::new(&database);
     let control_command = check_only
         || status_only
         || events
-        || retry_event.is_some()
         || prune_history_days.is_some()
         || backup_state.is_some()
         || backup_tasks.is_some()
         || reset_admin;
-    if check_only && once {
-        return Err("--check and --once cannot be used together".into());
-    }
     if check_write && !check_only {
         return Err("--check-write requires --check".into());
     }
-    if status_only && (check_only || once) {
-        return Err("--status cannot be combined with --check or --once".into());
+    if status_only && check_only {
+        return Err("--status cannot be combined with --check".into());
     }
     if json && !status_only && !events {
         return Err("--json requires --status or --events".into());
     }
-    if events
-        && (check_only || status_only || once || serve_addr.is_some() || retry_event.is_some())
-    {
+    if events && (check_only || status_only || serve_addr.is_some()) {
         return Err("--events cannot be combined with another control command".into());
-    }
-    if retry_event.is_some() && (check_only || status_only || once || serve_addr.is_some()) {
-        return Err("--retry-event cannot be combined with another control command".into());
     }
     if let Some(days) = prune_history_days {
         if days < 7 {
@@ -133,22 +106,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    if prune_history_days.is_some()
-        && (check_only
-            || status_only
-            || once
-            || serve_addr.is_some()
-            || retry_event.is_some()
-            || events)
+    if prune_history_days.is_some() && (check_only || status_only || serve_addr.is_some() || events)
     {
         return Err("--prune-history-days cannot be combined with another control command".into());
     }
     if backup_state.is_some()
         && (check_only
             || status_only
-            || once
             || serve_addr.is_some()
-            || retry_event.is_some()
             || events
             || prune_history_days.is_some())
     {
@@ -157,9 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if backup_tasks.is_some()
         && (check_only
             || status_only
-            || once
             || serve_addr.is_some()
-            || retry_event.is_some()
             || events
             || prune_history_days.is_some()
             || backup_state.is_some())
@@ -169,9 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if reset_admin
         && (check_only
             || status_only
-            || once
             || serve_addr.is_some()
-            || retry_event.is_some()
             || events
             || prune_history_days.is_some()
             || backup_state.is_some()
@@ -179,10 +140,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("--reset-admin cannot be combined with another control command".into());
     }
-    if serve_addr.is_some() && once {
-        return Err("--serve cannot be combined with --once".into());
-    }
-
     if let Some(destination) = backup_tasks {
         backup_task_database(database_path, Path::new(&destination))?;
         println!("SQLite task database backed up to {destination}");
@@ -200,7 +157,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = list_tasks(database_path)?
         .into_iter()
         .filter(|task| {
-            ((control_command && retry_event.is_none()) || task.enabled)
+            (control_command || task.enabled)
                 && match workspace.as_deref() {
                     Some(selected) => selected == task.item.workspace,
                     None => true,
@@ -307,84 +264,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
-    if let Some(event_id) = retry_event {
-        if retry_webhook(&config, event_id, retry_workspace.as_deref())? {
-            println!("webhook event {event_id} retried");
-            return Ok(());
-        }
-        return Err(format!("webhook event not retryable or not found: {event_id}").into());
-    }
-    if once {
-        return run_once(config);
-    }
-    if let Some(addr) = serve_addr {
-        return serve_webhook(&addr, database_path);
-    }
-
-    let mut schedule = JobScheduler::new();
-    let mut scheduled = false;
-    let mut one_time_failures = Vec::new();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    for item in config {
-        if let Some(crontab) = item.crontab.clone() {
-            scheduled = true;
-            let shutdown = Arc::clone(&shutdown);
-            schedule.add(Job::new(crontab.parse()?, move || {
-                if shutdown.load(Ordering::Relaxed) {
-                    return;
-                }
-                match cooldown_active(
-                    Path::new(&item.workspace),
-                    &item.source,
-                    &item.target,
-                    item.failure_cooldown_secs,
-                ) {
-                    Ok(true) => {
-                        eprintln!("sync {} paused by failure cooldown", item.workspace);
-                        return;
-                    }
-                    Err(error) => {
-                        eprintln!("sync {} cooldown check failed: {error}", item.workspace)
-                    }
-                    Ok(false) => {}
-                }
-                if let Err(error) = sync(&item) {
-                    eprintln!("sync {} failed: {error}", item.workspace);
-                }
-            }));
-        } else if let Err(error) = sync(&item) {
-            eprintln!("sync {} failed: {error}", item.workspace);
-            one_time_failures.push(item.workspace);
-        }
-    }
-
-    if scheduled {
-        let shutdown_handler = Arc::clone(&shutdown);
-        ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Relaxed))?;
-        while !shutdown.load(Ordering::Relaxed) {
-            schedule.tick();
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        eprintln!("shutdown requested");
-    }
-    if one_time_failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("sync failed: {}", one_time_failures.join(", ")).into())
-    }
-}
-
-fn run_once(config: Vec<Item>) -> Result<(), Box<dyn Error>> {
-    let mut failures = Vec::new();
-    for item in config {
-        if let Err(error) = sync(&item) {
-            eprintln!("sync {} failed: {error}", item.workspace);
-            failures.push(item.workspace);
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("sync failed: {}", failures.join(", ")).into())
-    }
+    let Some(addr) = serve_addr else {
+        return Err("--serve is required; run tasks from the Web page".into());
+    };
+    serve_webhook(&addr, database_path)
 }
