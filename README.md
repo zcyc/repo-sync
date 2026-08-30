@@ -1,146 +1,287 @@
 ![reposync logo](/images/logo.png)
 
 # repo-sync
-A lightweight synchronization tool for git repositories.
 
-## Manual
-```
-USAGE:
-    repo-sync [OPTIONS]
+把一个 Git 仓库同步到一个或多个目标仓库，支持分支同步、完整镜像、定时任务和 Webhook 触发。
 
-OPTIONS:
-    -c, --crontab <CRONTAB>     crontab string, eg: '0 * * * * ? *'
-    -d, --database <PATH>       SQLite task database path [default: repo-sync-tasks.sqlite3]
-    -h, --help                  Print help information
-        --allow-destructive    allow mirror mode to force-update and delete target refs
-        --divergence <POLICY>  divergence policy: fail, keep, or force [possible values: fail, keep, force]
-        --dry-run               show planned pushes without changing targets
-        --mode <MODE>           sync mode: branch or mirror [possible values: branch, mirror]
-        --sync-lfs              sync Git LFS objects
-        --tag-policy <POLICY>   tag conflict policy: preserve, fail, or force
-        --prune-branches        delete target branches absent from source
-        --prune-tags            delete target tags absent from source
-        --check                 validate task database and repository access only
-        --check-write           also test target write access with a dry-run push
-        --status                show persisted synchronization status
-        --json                  format --status as JSON
-        --serve <ADDR>          listen for Webhook POST triggers and serve the embedded page
-        --webhook-max-pending-events <N>
-                                maximum pending webhook events per sync item
-        --webhook-event-lease-secs <N>
-                                lease for a running webhook event in seconds
-        --events                show recent webhook event history
-        --retry-event <ID>      retry a failed or dead webhook event
-        --prune-history-days <DAYS>
-                                delete finished SQLite history older than DAYS
-        --backup-state <PATH>   backup one workspace SQLite database
-        --backup-tasks <PATH>   backup the SQLite task database
-        --reset-admin           clear the administrator account for offline recovery
-        --once                  run scheduled items once and exit
-    -s, --source <SOURCE>       source repo, eg: https://github.com/zcyc/repo-sync.git
-    -t, --target <TARGET>...    target repo, eg: https://github.com/zcyc/repo-sync.git
-        --branches <BRANCHES>... branch names or glob patterns; empty means all branches
-        --all-branches          sync all source branches
-        --timeout-secs <N>       Git command timeout in seconds
-        --atomic                require atomic target ref updates
-        --max-retries <N>       additional retries per Git command
-        --retry-backoff-secs <N> initial retry backoff in seconds
-        --failure-cooldown-secs <N>
-                                pause scheduled runs while every target is failing
-        --include-refs <REFS>... full ref glob patterns to include
-        --exclude-refs <REFS>... full ref glob patterns to exclude
-        --workspace <PATH>      local checkout path
-    -V, --version               Print version information
+## 先选用法
+
+| 场景 | 推荐方式 |
+| --- | --- |
+| 长期运行、管理多个任务 | `--serve` + Web 管理页面 |
+| 手动执行一次同步 | 直接传 `--source`、`--target` 等参数 |
+| 一次执行任务数据库里的所有任务 | `--once` |
+| 查看状态或维护 SQLite | `--status`、`--events`、`--backup-*` 等维护命令 |
+
+任务配置只存 SQLite，不读取 `config.toml`、JSON 或 TOML 配置文件。
+
+完整参数列表和当前版本号：
+
+```sh
+repo-sync --help
+repo-sync --version
 ```
 
-## Notice
-Before you begin the task, make sure that you can access and operate your source and target repositories.
+## 最快开始：Web 管理页面
 
-The source is cloned into the configured `workspace`. Later runs reuse that
-checkout only when its source URL and repository type match the configuration.
-Git arguments are passed directly to Git, so URLs and branch names are not
-interpreted by a shell.
+### 1. 构建
 
-## Task database
+```sh
+cargo build --release
+```
 
-Tasks are stored directly in the SQLite database passed with `--database`; no
-TOML/JSON configuration file is read. The default is `repo-sync-tasks.sqlite3` in the
-current directory. Start the listener with:
+### 2. 启动
+
+```sh
+./target/release/repo-sync \
+  --database ./repo-sync-tasks.sqlite3 \
+  --serve 127.0.0.1:8080
+```
+
+打开 <http://127.0.0.1:8080/>，首次访问时设置管理员账号和密码，然后点击“新建任务”。任务保存后立即生效。
+
+Web 表单已经提供安全的常用默认值：
+
+| 配置 | 默认值 |
+| --- | --- |
+| `mode` | `branch` |
+| `branches` | 空，即所有分支 |
+| `timeout_secs` | `300` |
+| `divergence` | `fail` |
+| `tag_policy` | `preserve` |
+| `atomic` | `true` |
+| `max_retries` / `retry_backoff_secs` | `3` / `5` |
+| `failure_cooldown_secs` | `60` |
+| `webhook_max_pending_events` / `webhook_event_lease_secs` | `10000` / `900` |
+| `dry_run`、`sync_lfs`、清理和破坏性操作 | 默认关闭 |
+
+管理员密码长度必须为 12–256 个字符。密码和 Webhook secret 不会写入任务 SQLite；任务中只保存 secret 的环境变量名。
+
+## 直接执行一次同步
+
+CLI 直连模式没有同步参数默认值，下面是一条可直接改写的安全起步命令。省略 `--crontab` 时执行一次后退出：
+
+```sh
+repo-sync \
+  --source 'https://github.com/example/source.git' \
+  --target 'https://github.com/example/target.git' \
+  --workspace './source-workspace' \
+  --mode branch \
+  --all-branches \
+  --timeout-secs 300 \
+  --divergence fail \
+  --tag-policy preserve \
+  --max-retries 3 \
+  --retry-backoff-secs 5 \
+  --failure-cooldown-secs 60 \
+  --webhook-max-pending-events 10000 \
+  --webhook-event-lease-secs 900
+```
+
+多个目标直接放在同一个 `--target` 后面：
+
+```sh
+--target 'https://example.com/team/a.git' 'https://example.com/team/b.git'
+```
+
+已有 workspace 必须是与 `--mode` 匹配的 Git 仓库，且 `origin` 必须指向同一个 source。不要把 workspace 设为当前目录 `.` 或父目录 `..`。首次同步会创建 workspace，后续同步复用它。
+
+先检查访问权限，不执行同步：
+
+```sh
+repo-sync <上面的参数> --check
+```
+
+连目标写权限也检查：
+
+```sh
+repo-sync <上面的参数> --check --check-write
+```
+
+## 同步模式和安全策略
+
+### `branch`：普通分支分发，推荐
+
+必须选择分支：
+
+```sh
+--branches main 'release/*'
+```
+
+或者同步所有分支：
+
+```sh
+--all-branches
+```
+
+目标分支比 source 多出提交时，`--divergence` 决定处理方式：
+
+| 值 | 行为 |
+| --- | --- |
+| `fail` | 报错，不覆盖目标分支 |
+| `keep` | 跳过这个目标分支，继续其他分支和目标 |
+| `force` | 使用 `force-with-lease` 更新目标分支 |
+
+标签冲突由 `--tag-policy` 决定：
+
+| 值 | 行为 |
+| --- | --- |
+| `preserve` | 保留目标标签，跳过冲突 |
+| `fail` | 遇到冲突立即报错 |
+| `force` | 使用 `force-with-lease` 更新目标标签 |
+
+### `mirror`：完整镜像，只用于可丢弃目标
+
+```sh
+repo-sync \
+  --source 'https://github.com/example/source.git' \
+  --target 'https://example.com/mirror.git' \
+  --workspace './mirror-workspace' \
+  --mode mirror \
+  --timeout-secs 300 \
+  --divergence fail \
+  --tag-policy force \
+  --max-retries 3 \
+  --retry-backoff-secs 5 \
+  --failure-cooldown-secs 60 \
+  --webhook-max-pending-events 10000 \
+  --webhook-event-lease-secs 900 \
+  --dry-run
+```
+
+`mirror` 会使用 `git clone --mirror`，同步选中的所有 refs，并删除目标中 source 没有的对应 refs。它不能同时设置 `--branches`、`--prune-branches` 或 `--prune-tags`，且 `tag_policy` 必须为 `force`。`divergence` 在 mirror 模式中不参与 ref 计划；CLI 直连模式仍需提供它。
+
+真正写入 mirror 目标前，去掉 `--dry-run`，并明确允许破坏性操作：
+
+```sh
+--allow-destructive
+```
+
+`mirror`、`divergence=force`、`tag_policy=force`、`--prune-branches` 和 `--prune-tags` 都属于破坏性操作。非 dry-run 时必须同时设置 `--allow-destructive`。普通分支分发通常不需要它。
+
+## refs 筛选
+
+这两个选项接收完整 ref glob，每个模式一个参数：
+
+```sh
+--include-refs 'refs/heads/*' \
+--exclude-refs 'refs/heads/tmp/*' 'refs/tags/nightly-*'
+```
+
+- `include_refs` 为空表示全部 refs。
+- `exclude_refs` 优先级更高；被排除的 ref 不会同步。
+- 模式必须以 `refs/` 开头。
+- shell 中的 `*`、`?` 请加引号。
+- `branch` 模式还会先经过 `--branches` 的分支名筛选。
+
+## 其他同步选项
+
+| 参数 | 用途 |
+| --- | --- |
+| `--dry-run` | 计算并显示 push 计划，不写入目标 refs |
+| `--sync-lfs` | 同步 Git LFS 对象；运行环境必须安装 Git LFS |
+| `--prune-branches` | 删除目标中 source 没有的、且在筛选范围内的分支 |
+| `--prune-tags` | 删除目标中 source 没有的、且在筛选范围内的标签 |
+| `--atomic` | 要求单个目标上的 ref 更新使用 atomic push |
+| `--crontab EXPR` | 按项目使用的 schedule 语法定时执行；不传则不定时 |
+
+`--atomic` 只覆盖“一个目标的一次 ref push”，多个目标、LFS 传输和 SQLite 状态更新不是一个事务。
+
+## 任务数据库模式
+
+使用 `--serve` 时，任务来自 `--database`：
 
 ```sh
 repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --serve 127.0.0.1:8080
 ```
 
-Open `/`, set the administrator account on first use, then log in to create,
-edit, enable, disable, or delete tasks. The page validates each task before
-saving it. A task contains the source
-and targets, workspace, branch/ref filters, safety policies, retry settings,
-schedule, and webhook secret environment variable names. Secret values are
-never stored in SQLite or returned by the API. The page also supports an
-immediate manual sync and password changes; changing the password invalidates
-all existing sessions and signs in the current browser again.
+启用后的任务行为：
 
-The task registry database and each workspace's `<workspace-name>.sqlite3`
-runtime state database are separate. The latter stores target state, run
-history, errors, durations, synced refs, webhook delivery ids, queue state, and
-dead-letter events. Both use SQLite WAL mode and a busy timeout for local
-readers.
+- 没有 `crontab`：等待 Webhook 或页面上的“立即同步”。
+- 有 `crontab`：按计划自动入队。
+- 页面上的“立即同步”、取消、重试和启停会立即生效。
+- `--once`：把当前加载的任务各执行一次，然后退出。
 
-`mirror` mode uses `git clone --mirror`, fetches all refs, and builds an explicit
-ref plan so `include_refs` and `exclude_refs` remain effective. It can
-force-update or delete selected refs on targets; use `allow_destructive = true`
-only when targets are disposable mirrors. The sample keeps this mode in dry-run
-until explicitly enabled. `branch` mode is the safe choice for ordinary branch
-fan-out. Before pushing branches, repo-sync checks the target with `git
-ls-remote` and compares commit ancestry. After a real push it verifies the
-selected target refs again.
+任务数据库和 workspace 状态库是分开的：
 
-`--check` performs read-only source/target access checks. `--check-write`
-requires an existing workspace and performs a target `git push --dry-run`; it
-can change only local remote configuration. `--status` reads the SQLite
-database, and `--status --json` is intended for scripts and monitoring.
+| 文件 | 内容 |
+| --- | --- |
+| `--database` 指定的 SQLite | 任务、管理员账号、会话 |
+| `<workspace 名>.sqlite3` | 目标状态、运行历史、Webhook 队列和事件 |
 
-`REPO_SYNC_WEBHOOK_SECRET_MAIN=... REPO_SYNC_WEBHOOK_SECRET_MIRROR=... repo-sync --database repo-sync.sqlite3 --serve 127.0.0.1:8080` starts a webhook listener. It authenticates and parses GitHub
-`push`/`delete` events and GitLab `Push Hook`/`Tag Push Hook` events, matches the
-payload repository and ref against the loaded items, then queues only matching
-syncs. GitHub uses `X-Hub-Signature-256`; GitLab signing tokens and legacy secret
-tokens are accepted. `/healthz` and `/readyz` are available without provider
-headers. Each item reads the environment variables named by
-`webhook_secret_envs`; send `SIGHUP` to reload tasks and rotate secrets
-without stopping the listener. The listener returns `202` after SQLite enqueue and a background worker
-performs the sync, so provider retries do not block on Git. Put it behind an
-existing TLS reverse proxy that forwards `X-Forwarded-Proto: https` and stop it
-with Ctrl-C. `/metrics` exposes Prometheus
-text metrics for request outcomes, queue status, deduplication, coalescing, and
-sync results; protect it at the reverse proxy if it is not on a private network.
-The listener caps active connections at 64 and returns `503` when saturated.
-Login failures are limited per client address: five failures in one minute
-temporarily block further login attempts for five minutes. The worker reacts
-to matching Webhook deliveries, manual runs, and scheduled runs immediately
-instead of scanning every task on a fixed polling interval. Webhook, manual,
-and cron triggers are persisted in the same SQLite event queue, so a process
-restart does not silently drop a requested run. The page can cancel
-queued or running work; a running Git command is stopped cooperatively and is
-not retried as a normal failure.
-For systemd, start from `repo-sync.service.example` and
-`webhook.env.example`; the example keeps the task database in
-`/var/lib/repo-sync` and the secrets in `/etc/repo-sync`. `systemctl reload
-repo-sync` reloads the task database.
+删除任务不会删除 workspace，也不会删除 workspace 的状态库。一个 workspace 只能属于一个任务。
 
-The embedded administration page is available at `/`. On first use, set the
-administrator username and a 12-256 character password; later visits use the
-account/password login and an HttpOnly session cookie. The page can view each
-task's latest and recent runs, target status, Webhook queue, and recent events;
-it can filter tasks, run or cancel work, retry failed events, and edit tasks
-directly in SQLite. Passwords are stored as Argon2id hashes and session tokens
-are stored only as hashes. Keep the listener on a private address or put it
-behind a TLS reverse proxy.
+## Webhook
 
-## systemd（Linux 可选）
+### 配置
 
-systemd 是 Linux 的系统和服务管理器。它可以在开机时启动 repo-sync，进程
-异常退出时自动重启，并把 stdout/stderr 纳入 journald，适合长期运行 Webhook
-监听器；macOS 和 Windows 不需要它。复制 `repo-sync.service.example` 后执行：
+1. 在任务的“高级选项”中，把 `webhook_secret_envs` 设置为环境变量名，例如 `REPO_SYNC_WEBHOOK_SECRET_MAIN`。
+2. 启动 listener 前设置对应的 secret：
+
+   ```sh
+   export REPO_SYNC_WEBHOOK_SECRET_MAIN='replace-with-a-long-random-secret'
+   repo-sync --database ./repo-sync-tasks.sqlite3 --serve 127.0.0.1:8080
+   ```
+
+3. 在 GitHub 或 GitLab 中把 Webhook URL 指向 listener，例如 `https://sync.example.com/webhook`。
+
+支持的事件和签名：
+
+| 提供方 | 事件 | 签名 |
+| --- | --- | --- |
+| GitHub | `push`、`delete` | `X-Hub-Signature-256` |
+| GitLab | `Push Hook`、`Tag Push Hook` | `Webhook-Signature` 或 `X-Gitlab-Token` |
+
+事件必须同时匹配任务的 source 和 refs 筛选，才会入队。listener 收到并写入 SQLite 队列后返回 `202`，Git 同步在后台执行；重复 delivery 会去重。
+
+### Listener 地址
+
+| 地址 | 用途 |
+| --- | --- |
+| `GET /` | 管理页面 |
+| `GET /healthz` | 存活检查 |
+| `GET /readyz` | 就绪检查 |
+| `GET /metrics` | Prometheus 文本指标 |
+| `POST /webhook` | GitHub/GitLab Webhook；POST 路径可使用反向代理统一规划 |
+
+listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在已有 TLS 反向代理后面，并限制 `/metrics` 的访问范围。配置更新后发送 `SIGHUP` 可重新加载任务和轮换 secret，无需停止进程。
+
+## 状态与维护
+
+```sh
+# 文本状态
+repo-sync --database ./repo-sync-tasks.sqlite3 --status
+
+# JSON 状态，适合脚本和监控
+repo-sync --database ./repo-sync-tasks.sqlite3 --status --json
+
+# 每个 workspace 最近 50 条 Webhook 事件
+repo-sync --database ./repo-sync-tasks.sqlite3 --events
+repo-sync --database ./repo-sync-tasks.sqlite3 --events --json
+
+# 重试失败或 dead 事件；ID 跨多个 workspace 重复时加 --workspace
+repo-sync --database ./repo-sync-tasks.sqlite3 --retry-event 42
+repo-sync --database ./repo-sync-tasks.sqlite3 --workspace ./source-workspace --retry-event 42
+
+# 只删除已结束且超过 30 天的历史；最小值为 7
+repo-sync --database ./repo-sync-tasks.sqlite3 --prune-history-days 30
+
+# 备份；目标文件必须不存在，不会覆盖已有文件
+repo-sync --database ./repo-sync-tasks.sqlite3 --backup-tasks ./tasks-backup.sqlite3
+repo-sync --database ./repo-sync-tasks.sqlite3 --backup-state ./workspace-state-backup.sqlite3
+```
+
+`--prune-history-days` 和 `--backup-state` 需要恰好加载一个同步任务；备份前确保目标路径不存在。丢失管理员密码时，先停止 listener，再执行：
+
+```sh
+repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --reset-admin
+```
+
+这只清除管理员账号和会话，不删除任务、workspace 或运行历史；下次打开页面时重新设置账号。
+
+## Linux systemd（可选）
+
+项目提供了 [repo-sync.service.example](repo-sync.service.example) 和 [webhook.env.example](webhook.env.example)。最小安装步骤：
 
 ```sh
 sudo install -d -o repo-sync -g repo-sync /var/lib/repo-sync /etc/repo-sync
@@ -148,76 +289,25 @@ sudo install -m 600 webhook.env.example /etc/repo-sync/webhook.env
 sudo install -m 644 repo-sync.service.example /etc/systemd/system/repo-sync.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now repo-sync
+```
+
+查看日志：
+
+```sh
 sudo journalctl -u repo-sync -f
 ```
 
-服务示例将任务数据库和 workspace 限制在 `/var/lib/repo-sync`，Webhook
-secret 放在 `/etc/repo-sync/webhook.env`；首次账号设置仍在 Web 页面完成。
+服务示例使用 `/var/lib/repo-sync` 保存任务数据库和 workspace，使用 `/etc/repo-sync/webhook.env` 保存 secret。修改任务数据库后执行 `sudo systemctl reload repo-sync`。
 
-`--events` shows the latest 50 webhook events per configured workspace;
-`--events --json` is suitable for monitoring. `--retry-event <ID>` resets a
-failed/dead event and executes it immediately. Event retries use the existing
-`max_retries` and `retry_backoff_secs` settings; exhausted events remain in the
-dead-letter state until manually retried. When several deliveries are waiting,
-one successful full-state sync coalesces the redundant queued deliveries. Event
-IDs are local to each workspace; pass `--workspace <PATH>` with
-`--retry-event <ID>` when the ID exists in more than one workspace.
-`--prune-history-days N` explicitly removes finished run and webhook history
-older than `N` days; `N` must be at least 7 so provider delivery IDs remain
-deduplicated across normal redeliveries. `--backup-state PATH` creates a
-non-overwriting workspace SQLite backup. `--backup-tasks PATH` creates a
-non-overwriting task-registry SQLite backup. The destination must not already
-exist, so use a timestamped filename. These maintenance commands never run
-automatically. If the administrator password is lost, stop the listener and
-run `repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --reset-admin`;
-the next visit to `/` will require setting a new account and password. This
-clears only the administrator account and sessions, not tasks or workspaces.
+每日任务数据库备份还可以使用 [repo-sync-backup.sh.example](repo-sync-backup.sh.example)、[repo-sync-backup.service.example](repo-sync-backup.service.example) 和 [repo-sync-backup.timer.example](repo-sync-backup.timer.example)。备份模板不会自动删除旧备份。
 
-`prometheus-alerts.example.yml` contains starter rules for queue stalls, sync
-failures, dead-letter events, and login abuse. Load it into Prometheus and use
-Alertmanager for notification routing and deduplication.
+## 认证、凭据和升级注意事项
 
-For Linux, the optional `repo-sync-backup.sh.example`,
-`repo-sync-backup.service.example`, and `repo-sync-backup.timer.example` run a
-daily task-database snapshot with a unique UTC filename. Install the script as
-`/usr/local/libexec/repo-sync-backup`, install both unit files under
-`/etc/systemd/system`, then run:
+- HTTP(S) 仓库 URL 不能包含用户名或密码；使用 SSH agent 或 Git credential helper。
+- 配置错误会在同步开始前拒绝；单个目标失败不会阻止其他目标继续尝试。
+- Git 不会等待交互式凭据输入。
+- 当前版本的 SQLite schema 不兼容旧数据库；旧的 `--file`、`config.toml`、JSON/TOML 配置加载器、`REPO_SYNC_ADMIN_TOKEN`、旧的全局 `REPO_SYNC_WEBHOOK_SECRET` 和通用 `X-Repo-Sync-Secret` 均不再支持。旧数据库不会迁移，需要移除后重新创建任务库。
 
-```sh
-sudo install -d -m 755 /usr/local/libexec
-sudo install -d -o repo-sync -g repo-sync -m 700 /var/lib/repo-sync/backups
-sudo install -m 700 repo-sync-backup.sh.example /usr/local/libexec/repo-sync-backup
-sudo install -m 644 repo-sync-backup.service.example repo-sync-backup.timer.example /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now repo-sync-backup.timer
-```
+## License
 
-The template does not delete old backups; apply the retention policy used by
-your host separately.
-
-`atomic` applies to one Git ref push for one target. Multiple targets, LFS
-transfers, and the SQLite status update are separate operations and are not one
-transaction.
-
-Existing workspaces must point to the exact configured source and use the
-configured repository type. Credentials in HTTP(S) URLs are rejected;
-configure an SSH agent or Git credential helper instead. This task storage
-change is intentionally breaking: `--file`, `config.toml`, the old JSON/TOML
-configuration loader, `REPO_SYNC_ADMIN_TOKEN`, and the old global
-`REPO_SYNC_WEBHOOK_SECRET` are no longer supported. SQLite databases without the current schema version are
-rejected and must be removed and rebuilt; no task or runtime-state migration
-is provided. Deleting a task does not delete its workspace or runtime-state
-database. The old generic `X-Repo-Sync-Secret` webhook is not accepted.
-
-For one-time runs, omit `crontab`. In database mode, disabled tasks are not
-scheduled or processed; enabled tasks without a schedule run once, while
-scheduled tasks continue running in the scheduler.
-Configuration errors are rejected before any sync starts. A failed target does
-not prevent other targets from being attempted, and Git never waits for an
-interactive terminal credential prompt. Use `--check` for a read-only access
-check, `--check-write` to test target write access, `--status` to inspect state,
-and `--once` to execute scheduled items once without entering the loop.
-
-## Why Not
-- [git-sync](https://github.com/kubernetes/git-sync) of `kubernetes` only synchronizes the repository into the folder.
-- [Repository mirroring](https://docs.gitlab.com/ee/user/project/repository/mirror/) of `GitLab` requires a paid version.
+见 [LICENSE](LICENSE)。
