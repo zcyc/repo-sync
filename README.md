@@ -109,7 +109,8 @@ headers. Each item reads the environment variables named by
 `webhook_secret_envs`; send `SIGHUP` to reload tasks and rotate secrets
 without stopping the listener. The listener returns `202` after SQLite enqueue and a background worker
 performs the sync, so provider retries do not block on Git. Put it behind an
-existing TLS reverse proxy and stop it with Ctrl-C. `/metrics` exposes Prometheus
+existing TLS reverse proxy that forwards `X-Forwarded-Proto: https` and stop it
+with Ctrl-C. `/metrics` exposes Prometheus
 text metrics for request outcomes, queue status, deduplication, coalescing, and
 sync results; protect it at the reverse proxy if it is not on a private network.
 The listener caps active connections at 64 and returns `503` when saturated.

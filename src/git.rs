@@ -568,18 +568,17 @@ fn redact(value: &str) -> String {
                 })
                 .map(|offset| start + offset)
                 .unwrap_or(output.len());
-            let Some(authority_end) = output[start..end].find('/') else {
-                search_from = end;
-                continue;
-            };
-            let authority_end = start + authority_end;
+            let authority_end = output[start..end]
+                .find(['/', '?', '#'])
+                .map(|offset| start + offset)
+                .unwrap_or(end);
             let Some(at) = output[start..authority_end].rfind('@') else {
                 search_from = end;
                 continue;
             };
             let at = start + at;
             output.replace_range(start..at, "***");
-            search_from = at + 3;
+            search_from = start + 3;
         }
     }
     output
@@ -588,7 +587,8 @@ fn redact(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cancel_workspace, cancellation_requested, receive_output, CancellationScope, ManagedChild,
+        cancel_workspace, cancellation_requested, receive_output, redact, CancellationScope,
+        ManagedChild,
     };
     #[cfg(unix)]
     use super::{output, RetryPolicy};
@@ -616,6 +616,14 @@ mod tests {
         }
         let _scope = CancellationScope::enter(workspace);
         assert!(!cancellation_requested());
+    }
+
+    #[test]
+    fn redacts_credentials_without_a_url_path() {
+        assert_eq!(
+            redact("fatal: https://user:password@example.com"),
+            "fatal: https://***@example.com"
+        );
     }
 
     #[cfg(unix)]

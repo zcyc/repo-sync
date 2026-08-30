@@ -18,7 +18,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc, Mutex, RwLock,
     },
@@ -28,8 +28,11 @@ use std::{
 
 type HmacSha256 = Hmac<Sha256>;
 
+static IN_FLIGHT_BODY_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IN_FLIGHT_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: u64 = 64;
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,6 +57,38 @@ struct HttpRequest {
     path: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    _body_budget: BodyBudget,
+}
+
+struct BodyBudget {
+    bytes: usize,
+}
+
+impl Drop for BodyBudget {
+    fn drop(&mut self) {
+        IN_FLIGHT_BODY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+fn reserve_body_budget(bytes: usize) -> Result<BodyBudget, &'static str> {
+    let mut current = IN_FLIGHT_BODY_BYTES.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(bytes)
+            .ok_or("request body capacity exhausted")?;
+        if next > MAX_IN_FLIGHT_BODY_BYTES {
+            return Err("request body capacity exhausted");
+        }
+        match IN_FLIGHT_BODY_BYTES.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(BodyBudget { bytes }),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -648,10 +683,13 @@ fn worker_loop(
                         pending_tasks.insert(task_id, next_attempt_ms);
                     }
                 }
-                Err(error) => eprintln!(
-                    "webhook queue reschedule failed for {}: {error}",
-                    item.item.workspace
-                ),
+                Err(error) => {
+                    eprintln!(
+                        "webhook queue reschedule failed for {}: {error}",
+                        item.item.workspace
+                    );
+                    pending_tasks.insert(task_id, state::now_ms().saturating_add(1_000));
+                }
             }
         }
         match wake_receiver.recv_timeout(Duration::from_millis(500)) {
@@ -880,6 +918,18 @@ fn handle_connection(
             "200 OK",
             "text/html; charset=utf-8",
             dashboard::HTML,
+        );
+        return;
+    }
+    if request.method != "GET"
+        && path.starts_with("/api/")
+        && !same_origin_request(&request.headers)
+    {
+        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        write_response(
+            &mut stream,
+            "403 Forbidden",
+            "cross-origin request rejected",
         );
         return;
     }
@@ -1389,7 +1439,12 @@ fn handle_auth_request(
                 }
             };
             match tasks::setup_admin(database_path, &credentials.username, &credentials.password) {
-                Ok(session) => write_session_response(stream, "201 Created", &session),
+                Ok(session) => write_session_response(
+                    stream,
+                    "201 Created",
+                    &session,
+                    secure_cookie(&request.headers),
+                ),
                 Err(error) => {
                     eprintln!("auth setup failed: {error}");
                     write_response(stream, "400 Bad Request", "invalid credentials");
@@ -1421,7 +1476,12 @@ fn handle_auth_request(
             match tasks::login_admin(database_path, &credentials.username, &credentials.password) {
                 Ok(session) => {
                     login_limiter.record_success(peer.ip());
-                    write_session_response(stream, "200 OK", &session);
+                    write_session_response(
+                        stream,
+                        "200 OK",
+                        &session,
+                        secure_cookie(&request.headers),
+                    );
                 }
                 Err(_) => {
                     login_limiter.record_failure(peer.ip());
@@ -1457,7 +1517,12 @@ fn handle_auth_request(
                 &credentials.current_password,
                 &credentials.new_password,
             ) {
-                Ok(session) => write_session_response(stream, "200 OK", &session),
+                Ok(session) => write_session_response(
+                    stream,
+                    "200 OK",
+                    &session,
+                    secure_cookie(&request.headers),
+                ),
                 Err(_) => write_response(stream, "400 Bad Request", "invalid password request"),
             }
         }
@@ -1472,7 +1537,7 @@ fn handle_auth_request(
                 "204 No Content",
                 "text/plain; charset=utf-8",
                 "",
-                "repo_sync_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/",
+                &session_cookie("", 0, secure_cookie(&request.headers)),
             );
         }
         _ => {
@@ -1491,16 +1556,17 @@ fn session_token(headers: &BTreeMap<String, String>) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-fn write_session_response(stream: &mut TcpStream, status: &str, session: &tasks::LoginSession) {
+fn write_session_response(
+    stream: &mut TcpStream,
+    status: &str,
+    session: &tasks::LoginSession,
+    secure: bool,
+) {
     let body = format!(
         r#"{{"username":{}}}"#,
         serde_json::to_string(&session.username).unwrap_or_else(|_| "\"admin\"".into())
     );
-    let cookie = format!(
-        "repo_sync_session={}; Max-Age={}; HttpOnly; SameSite=Strict; Path=/",
-        session.token,
-        12 * 60 * 60
-    );
+    let cookie = session_cookie(&session.token, 12 * 60 * 60, secure);
     write_response_with_cookie(
         stream,
         status,
@@ -1508,6 +1574,35 @@ fn write_session_response(stream: &mut TcpStream, status: &str, session: &tasks:
         &body,
         &cookie,
     );
+}
+
+fn session_cookie(token: &str, max_age: i64, secure: bool) -> String {
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    format!(
+        "repo_sync_session={token}; Max-Age={max_age}; HttpOnly; SameSite=Strict; Path=/{secure_attribute}"
+    )
+}
+
+fn secure_cookie(headers: &BTreeMap<String, String>) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
+}
+
+fn same_origin_request(headers: &BTreeMap<String, String>) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
+    };
+    let Some(host) = headers.get("host") else {
+        return false;
+    };
+    let scheme = if secure_cookie(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    origin.eq_ignore_ascii_case(&format!("{scheme}://{host}"))
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
@@ -1541,11 +1636,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
     let mut request_fields = request_line.split_whitespace();
     let method = request_fields.next().ok_or("missing method")?.to_owned();
     let path = request_fields.next().ok_or("missing path")?.to_owned();
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        let (name, value) = line.split_once(':').ok_or("invalid header")?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
-    }
+    let headers = parse_headers(lines)?;
     let body_length = headers
         .get("content-length")
         .map(|value| value.parse::<usize>().map_err(|_| "invalid content length"))
@@ -1554,6 +1645,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
     if body_length > MAX_BODY_BYTES {
         return Err("request body too large");
     }
+    let body_budget = reserve_body_budget(body_length)?;
     let required = header_end
         .checked_add(body_length)
         .ok_or("request too large")?;
@@ -1572,7 +1664,31 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
         path,
         headers,
         body: request[header_end..required].to_vec(),
+        _body_budget: body_budget,
     })
+}
+
+fn parse_headers<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<BTreeMap<String, String>, &'static str> {
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or("invalid header")?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("invalid header");
+        }
+        if headers
+            .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+            .is_some()
+        {
+            return Err("duplicate header");
+        }
+    }
+    if headers.contains_key("transfer-encoding") {
+        return Err("transfer encoding is unsupported");
+    }
+    Ok(headers)
 }
 
 fn request_header_end(request: &[u8]) -> Result<Option<usize>, &'static str> {
@@ -1994,8 +2110,9 @@ fn write_response_with_cookie_and_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_label, parse_event, request_header_end, should_coalesce_webhook_events,
-        verify_event, verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
+        escape_label, parse_event, parse_headers, request_header_end, same_origin_request,
+        secure_cookie, session_cookie, should_coalesce_webhook_events, verify_event,
+        verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
     };
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2032,6 +2149,46 @@ mod tests {
             request_header_end(&request),
             Err("request headers too large")
         ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_request_framing_headers() {
+        assert!(matches!(
+            parse_headers(["Content-Length: 1", "Content-Length: 2"].into_iter()),
+            Err("duplicate header")
+        ));
+        assert!(matches!(
+            parse_headers(["Transfer-Encoding: chunked"].into_iter()),
+            Err("transfer encoding is unsupported")
+        ));
+    }
+
+    #[test]
+    fn body_budget_rejects_excess_in_flight_payloads() {
+        let budget = super::reserve_body_budget(super::MAX_IN_FLIGHT_BODY_BYTES).unwrap();
+        assert!(super::reserve_body_budget(1).is_err());
+        drop(budget);
+        assert!(super::reserve_body_budget(1).is_ok());
+    }
+
+    #[test]
+    fn rejects_cross_origin_mutations_and_marks_tls_cookies_secure() {
+        let same_origin = BTreeMap::from([
+            ("host".into(), "127.0.0.1:8080".into()),
+            ("origin".into(), "http://127.0.0.1:8080".into()),
+        ]);
+        assert!(same_origin_request(&same_origin));
+
+        let cross_origin = BTreeMap::from([
+            ("host".into(), "127.0.0.1:8080".into()),
+            ("origin".into(), "http://evil.example".into()),
+        ]);
+        assert!(!same_origin_request(&cross_origin));
+
+        let forwarded_https = BTreeMap::from([("x-forwarded-proto".into(), "https".into())]);
+        assert!(secure_cookie(&forwarded_https));
+        assert!(session_cookie("token", 60, true).contains("; Secure"));
+        assert!(!session_cookie("token", 60, false).contains("; Secure"));
     }
 
     #[test]

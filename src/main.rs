@@ -1,5 +1,5 @@
 use clap::Parser;
-use job_scheduler_ng::{Job, JobScheduler, Schedule};
+use job_scheduler_ng::{Job, JobScheduler};
 use repo_sync::{
     backup_task_database, check, check_task_database, cooldown_active, list_tasks,
     retry_event as retry_webhook, serve_webhook, status_report, sync, validate, webhook_events,
@@ -373,12 +373,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !config.is_empty() {
         validate(&config)?;
     }
-    for item in &config {
-        if let Some(crontab) = item.crontab.as_deref() {
-            crontab.parse::<Schedule>()?;
-        }
-    }
-
     if check_only {
         check_task_database(database_path)?;
         for item in &config {

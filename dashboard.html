@@ -414,7 +414,14 @@
     refresh.addEventListener('click', load);
     taskFilter.addEventListener('input', render);
     statusFilter.addEventListener('change', render);
-    logout.addEventListener('click', async () => { await request('/api/auth/logout', { method: 'POST' }); showAuth(true); message.textContent = '已退出登录'; message.className = 'muted'; });
+    logout.addEventListener('click', async () => {
+      try {
+        await request('/api/auth/logout', { method: 'POST' });
+        showAuth(true); message.textContent = '已退出登录'; message.className = 'muted';
+      } catch (error) {
+        message.textContent = `退出登录失败：${error.message}`; message.className = 'error';
+      }
+    });
     setForm(); initAuth(); setInterval(() => { if (document.visibilityState === 'visible' && !app.hidden) load(); }, 5000);
   </script>
 </body>

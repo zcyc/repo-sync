@@ -218,7 +218,7 @@ pub fn check(item: &Item, check_write: bool) -> Result<(), Box<dyn Error>> {
     let current_dir = Path::new(".");
     let source_heads = remote_refs(
         current_dir,
-        &["ls-remote", "--heads", item.source.as_str()],
+        &["ls-remote", "--heads", "--", item.source.as_str()],
         timeout,
         retry,
     )?;
@@ -237,14 +237,14 @@ pub fn check(item: &Item, check_write: bool) -> Result<(), Box<dyn Error>> {
     if matches!(item.mode, SyncMode::Mirror) {
         git::run(
             current_dir,
-            &["ls-remote", item.source.as_str()],
+            &["ls-remote", "--", item.source.as_str()],
             timeout,
             retry,
         )?;
     }
     git::run(
         current_dir,
-        &["ls-remote", "--tags", item.source.as_str()],
+        &["ls-remote", "--tags", "--", item.source.as_str()],
         timeout,
         retry,
     )?;
@@ -255,7 +255,7 @@ pub fn check(item: &Item, check_write: bool) -> Result<(), Box<dyn Error>> {
         validate_workspace(Path::new(&item.workspace), item, timeout)?;
     }
     for target in &item.target {
-        git::run(current_dir, &["ls-remote", target], timeout, retry)?;
+        git::run(current_dir, &["ls-remote", "--", target], timeout, retry)?;
     }
     if check_write {
         let repo_dir = Path::new(&item.workspace);
@@ -333,7 +333,7 @@ fn source_refs(
         repo_dir,
         &[
             "for-each-ref",
-            "--format=%(refname:strip=3) %(objectname)",
+            "--format=%(refname:strip=3)%09%(objectname)",
             "refs/remotes/origin",
         ],
         timeout,
@@ -348,9 +348,7 @@ fn source_refs(
     let mut branches = String::from_utf8_lossy(&branch_output.stdout)
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let branch = fields.next()?;
-            let sha = fields.next()?;
+            let (branch, sha) = ref_fields(line)?;
             let reference = format!("refs/heads/{branch}");
             (branch != "HEAD"
                 && config::branch_selected(&item.branches, branch)
@@ -373,7 +371,7 @@ fn source_refs(
         repo_dir,
         &[
             "for-each-ref",
-            "--format=%(refname:strip=2) %(objectname)",
+            "--format=%(refname:strip=2)%09%(objectname)",
             "refs/tags",
         ],
         timeout,
@@ -388,9 +386,7 @@ fn source_refs(
     let mut tags = String::from_utf8_lossy(&tag_output.stdout)
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let tag = fields.next()?;
-            let sha = fields.next()?;
+            let (tag, sha) = ref_fields(line)?;
             let reference = format!("refs/tags/{tag}");
             config::ref_selected(&item.include_refs, &item.exclude_refs, &reference).then(|| {
                 SourceTag {
@@ -425,6 +421,7 @@ fn sync_source(
             SyncMode::Branch => vec![
                 "clone",
                 "--no-checkout",
+                "--",
                 item.source.as_str(),
                 item.workspace.as_str(),
             ],
@@ -652,6 +649,10 @@ fn branch_plan(
         }
         if divergent && item.divergence == DivergencePolicy::Keep {
             plan.skipped_branches += 1;
+            if let Some(target_sha) = target_sha {
+                plan.synced_refs
+                    .insert(format!("refs/heads/{}", source_branch.branch), target_sha);
+            }
             continue;
         }
         plan.refspecs.push(format!(
@@ -721,7 +722,11 @@ fn append_tag_plan(
                 );
             }
             Some(target_sha) => match item.tag_policy {
-                TagPolicy::Preserve => plan.skipped_tags += 1,
+                TagPolicy::Preserve => {
+                    plan.skipped_tags += 1;
+                    plan.synced_refs
+                        .insert(format!("refs/tags/{}", source_tag.tag), target_sha.clone());
+                }
                 TagPolicy::Fail => {
                     return Err(io::Error::other(format!(
                         "target tag is divergent: {}",
@@ -879,9 +884,7 @@ fn remote_refs(
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let sha = fields.next()?;
-            let name = fields.next()?;
+            let (sha, name) = ref_fields(line)?;
             if name.ends_with("^{}") {
                 return None;
             }
@@ -910,9 +913,7 @@ fn all_remote_refs(
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let sha = fields.next()?;
-            let reference = fields.next()?;
+            let (sha, reference) = ref_fields(line)?;
             if reference.ends_with("^{}") || !reference.starts_with("refs/") {
                 return None;
             }
@@ -1000,7 +1001,11 @@ fn local_refs(
 ) -> io::Result<BTreeMap<String, String>> {
     let output = git::output(
         repo_dir,
-        &["for-each-ref", "--format=%(refname) %(objectname)", "refs"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs",
+        ],
         timeout,
         retry,
     )?;
@@ -1013,10 +1018,14 @@ fn local_refs(
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+            let (reference, sha) = ref_fields(line)?;
+            Some((reference.to_owned(), sha.to_owned()))
         })
         .collect())
+}
+
+fn ref_fields(line: &str) -> Option<(&str, &str)> {
+    line.split_once('\t')
 }
 
 struct WorkspaceLock {
@@ -1100,4 +1109,17 @@ fn stale_lock(path: &Path) -> bool {
     #[cfg(not(unix))]
     let _ = pid;
     created_ms.is_some_and(|created| state::now_ms().saturating_sub(created) > 86_400_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ref_fields;
+
+    #[test]
+    fn parses_ref_names_containing_spaces() {
+        assert_eq!(
+            ref_fields("refs/heads/feature with spaces\t0123456789abcdef"),
+            Some(("refs/heads/feature with spaces", "0123456789abcdef"))
+        );
+    }
 }

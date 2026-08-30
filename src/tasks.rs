@@ -14,12 +14,14 @@ use std::{
     error::Error,
     io,
     path::Path,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 3;
 const SESSION_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+static TASK_INITIALIZATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     task_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +69,12 @@ pub(crate) struct TaskDb {
 
 impl TaskDb {
     pub(crate) fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let connection = Connection::open(path)?;
+        // ponytail: one process-wide init lock; use per-database locks only if open contention is measurable.
+        let _initialization_lock = TASK_INITIALIZATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| io::Error::other("task initialization lock poisoned"))?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let user_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -97,10 +104,12 @@ impl TaskDb {
              PRAGMA synchronous = NORMAL;
              ",
         )?;
-        connection.execute_batch(SCHEMA)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA)?;
         if user_version == 0 {
-            connection.execute_batch("PRAGMA user_version = 3;")?;
+            transaction.execute_batch("PRAGMA user_version = 3;")?;
         }
+        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -739,6 +748,40 @@ mod tests {
         let mut db = TaskDb::open(&database).unwrap();
         assert!(db.reset_admin().unwrap());
         assert!(!db.auth_initialized().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_task_initialization_is_idempotent() {
+        let sequence = NEXT_TASK_TEST.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-task-race-test-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("tasks.sqlite3");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let database = database.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    TaskDb::open(&database)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
         let _ = fs::remove_dir_all(root);
     }
 }

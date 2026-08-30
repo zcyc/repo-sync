@@ -1,3 +1,4 @@
+use job_scheduler_ng::Schedule;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -103,6 +104,9 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     if item.source.trim().is_empty() {
         return Err("source cannot be empty".into());
     }
+    if item.source.starts_with('-') {
+        return Err("source cannot start with '-'".into());
+    }
     if item.target.is_empty() {
         return Err("at least one target is required".into());
     }
@@ -110,6 +114,9 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     for (index, target) in item.target.iter().enumerate() {
         if target.trim().is_empty() {
             return Err(format!("target {index} cannot be empty").into());
+        }
+        if target.starts_with('-') {
+            return Err(format!("target {index} cannot start with '-'").into());
         }
         if !targets.insert(target) {
             return Err(format!("target {index} is duplicated").into());
@@ -123,11 +130,17 @@ pub fn validate_item(item: &Item) -> Result<(), Box<dyn Error>> {
     {
         return Err("workspace must be a non-current directory".into());
     }
+    if item.workspace.starts_with('-') {
+        return Err("workspace cannot start with '-'".into());
+    }
     if workspace_identity(workspace)? == std::env::current_dir()?.canonicalize()? {
         return Err("workspace must be a non-current directory".into());
     }
     if item.timeout_secs == 0 {
         return Err("timeout_secs must be greater than zero".into());
+    }
+    if let Some(crontab) = item.crontab.as_deref() {
+        crontab.parse::<Schedule>()?;
     }
     if item.max_retries > 10 {
         return Err("max_retries cannot be greater than 10".into());
@@ -311,6 +324,28 @@ mod tests {
         let mut config = item();
         config.source = "https://user:secret@example.com/repo.git".into();
         assert!(validate(&[config]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_crontab() {
+        let mut config = item();
+        config.crontab = Some("not a crontab".into());
+        assert!(validate_item(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_git_option_injection_values() {
+        let mut config = item();
+        config.source = "--upload-pack=evil".into();
+        assert!(validate_item(&config).is_err());
+
+        let mut config = item();
+        config.target = vec!["--upload-pack=evil".into()];
+        assert!(validate_item(&config).is_err());
+
+        let mut config = item();
+        config.workspace = "-workspace".into();
+        assert!(validate_item(&config).is_err());
     }
 
     #[test]

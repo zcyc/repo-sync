@@ -5,6 +5,7 @@ use std::{
     error::Error,
     io,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -70,6 +71,7 @@ CREATE INDEX IF NOT EXISTS webhook_events_history_idx
 "#;
 const SCHEMA_VERSION: i64 = 2;
 const MIN_WEBHOOK_DEDUP_RETENTION_DAYS: u64 = 7;
+static STATE_INITIALIZATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) struct StateDb {
     connection: Connection,
@@ -168,6 +170,11 @@ pub(crate) struct WebhookEventInput<'a> {
 impl StateDb {
     pub(crate) fn open(workspace: &Path, source: &str) -> Result<Self, Box<dyn Error>> {
         let path = database_path(workspace)?;
+        // ponytail: one process-wide init lock; use per-database locks only if open contention is measurable.
+        let _initialization_lock = STATE_INITIALIZATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| io::Error::other("state initialization lock poisoned"))?;
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         configure(&connection)?;
