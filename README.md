@@ -9,7 +9,7 @@
 | 场景 | 推荐方式 |
 | --- | --- |
 | 长期运行、管理多个任务 | `--serve` + Web 管理页面 |
-| 手动执行一次同步 | 直接传 `--source`、`--target` 等参数 |
+| 手动执行一次同步 | Web 页面中的“立即同步” |
 | 一次执行任务数据库里的所有任务 | `--once` |
 | 查看状态或维护 SQLite | `--status`、`--events`、`--backup-*` 等维护命令 |
 
@@ -57,64 +57,28 @@ Web 表单已经提供安全的常用默认值：
 
 管理员密码长度必须为 12–256 个字符。密码和 Webhook secret 不会写入任务 SQLite；任务中只保存 secret 的环境变量名。
 
-## 直接执行一次同步
+## 在 Web 页面创建任务
 
-CLI 直连模式没有同步参数默认值，下面是一条可直接改写的安全起步命令。省略 `--crontab` 时执行一次后退出：
+点击“新建任务”，先填写这 4 项：
 
-```sh
-repo-sync \
-  --source 'https://github.com/example/source.git' \
-  --target 'https://github.com/example/target.git' \
-  --workspace './source-workspace' \
-  --mode branch \
-  --all-branches \
-  --timeout-secs 300 \
-  --divergence fail \
-  --tag-policy preserve \
-  --max-retries 3 \
-  --retry-backoff-secs 5 \
-  --failure-cooldown-secs 60 \
-  --webhook-max-pending-events 10000 \
-  --webhook-event-lease-secs 900
-```
+| 字段 | 填什么 |
+| --- | --- |
+| 源仓库 URL 或路径 | source Git 仓库 |
+| 目标仓库 | 一个或多个 target，每行一个 |
+| Workspace | 本地工作目录；不能是 `.` 或 `..` |
+| 模式 | 普通分发选 `branch`；可丢弃的完整镜像选 `mirror` |
 
-多个目标直接放在同一个 `--target` 后面：
+已有 workspace 必须是与模式匹配的 Git 仓库，且 `origin` 必须指向同一个 source。首次同步会创建 workspace，后续同步复用它。
 
-```sh
---target 'https://example.com/team/a.git' 'https://example.com/team/b.git'
-```
-
-已有 workspace 必须是与 `--mode` 匹配的 Git 仓库，且 `origin` 必须指向同一个 source。不要把 workspace 设为当前目录 `.` 或父目录 `..`。首次同步会创建 workspace，后续同步复用它。
-
-先检查访问权限，不执行同步：
-
-```sh
-repo-sync <上面的参数> --check
-```
-
-连目标写权限也检查：
-
-```sh
-repo-sync <上面的参数> --check --check-write
-```
+保存任务后可以点击“立即同步”。保存、启停、取消和重试都会立即生效。
 
 ## 同步模式和安全策略
 
 ### `branch`：普通分支分发，推荐
 
-必须选择分支：
+在“分支”字段中填写分支名或 glob，每行一个，例如 `main`、`release/*`；留空表示所有分支。
 
-```sh
---branches main 'release/*'
-```
-
-或者同步所有分支：
-
-```sh
---all-branches
-```
-
-目标分支比 source 多出提交时，`--divergence` 决定处理方式：
+目标分支比 source 多出提交时，“分支分叉策略”决定处理方式：
 
 | 值 | 行为 |
 | --- | --- |
@@ -122,7 +86,7 @@ repo-sync <上面的参数> --check --check-write
 | `keep` | 跳过这个目标分支，继续其他分支和目标 |
 | `force` | 使用 `force-with-lease` 更新目标分支 |
 
-标签冲突由 `--tag-policy` 决定：
+标签冲突由“标签冲突策略”决定：
 
 | 值 | 行为 |
 | --- | --- |
@@ -132,62 +96,39 @@ repo-sync <上面的参数> --check --check-write
 
 ### `mirror`：完整镜像，只用于可丢弃目标
 
-```sh
-repo-sync \
-  --source 'https://github.com/example/source.git' \
-  --target 'https://example.com/mirror.git' \
-  --workspace './mirror-workspace' \
-  --mode mirror \
-  --timeout-secs 300 \
-  --divergence fail \
-  --tag-policy force \
-  --max-retries 3 \
-  --retry-backoff-secs 5 \
-  --failure-cooldown-secs 60 \
-  --webhook-max-pending-events 10000 \
-  --webhook-event-lease-secs 900 \
-  --dry-run
-```
+`mirror` 会使用 `git clone --mirror`，同步选中的所有 refs，并删除目标中 source 没有的对应 refs。它不能设置分支筛选或分支/标签清理，且标签冲突策略必须为 `force`。真正写入前先勾选“Dry run”验证计划，再取消 Dry run 并勾选“允许破坏性操作”。
 
-`mirror` 会使用 `git clone --mirror`，同步选中的所有 refs，并删除目标中 source 没有的对应 refs。它不能同时设置 `--branches`、`--prune-branches` 或 `--prune-tags`，且 `tag_policy` 必须为 `force`。`divergence` 在 mirror 模式中不参与 ref 计划；CLI 直连模式仍需提供它。
-
-真正写入 mirror 目标前，去掉 `--dry-run`，并明确允许破坏性操作：
-
-```sh
---allow-destructive
-```
-
-`mirror`、`divergence=force`、`tag_policy=force`、`--prune-branches` 和 `--prune-tags` 都属于破坏性操作。非 dry-run 时必须同时设置 `--allow-destructive`。普通分支分发通常不需要它。
+`mirror`、分叉策略 `force`、标签策略 `force` 以及分支/标签清理都属于破坏性操作。普通分支分发通常不需要“允许破坏性操作”。
 
 ## refs 筛选
 
-这两个选项接收完整 ref glob，每个模式一个参数：
-
-```sh
---include-refs 'refs/heads/*' \
---exclude-refs 'refs/heads/tmp/*' 'refs/tags/nightly-*'
-```
+在“包含 refs”和“排除 refs”字段中填写完整 ref glob，每行一个，例如 `refs/heads/*`、`refs/tags/nightly-*`。
 
 - `include_refs` 为空表示全部 refs。
 - `exclude_refs` 优先级更高；被排除的 ref 不会同步。
 - 模式必须以 `refs/` 开头。
 - shell 中的 `*`、`?` 请加引号。
-- `branch` 模式还会先经过 `--branches` 的分支名筛选。
+- `branch` 模式还会先经过“分支”字段的分支名筛选。
 
-## 其他同步选项
+## 高级选项
 
-| 参数 | 用途 |
+| 字段 | 用途 |
 | --- | --- |
-| `--dry-run` | 计算并显示 push 计划，不写入目标 refs |
-| `--sync-lfs` | 同步 Git LFS 对象；运行环境必须安装 Git LFS |
-| `--prune-branches` | 删除目标中 source 没有的、且在筛选范围内的分支 |
-| `--prune-tags` | 删除目标中 source 没有的、且在筛选范围内的标签 |
-| `--atomic` | 要求单个目标上的 ref 更新使用 atomic push |
-| `--crontab EXPR` | 按项目使用的 schedule 语法定时执行；不传则不定时 |
+| `dry_run` | 计算并显示 push 计划，不写入目标 refs |
+| `sync_lfs` | 同步 Git LFS 对象；运行环境必须安装 Git LFS |
+| `prune_branches` / `prune_tags` | 删除目标中 source 没有的、且在筛选范围内的分支/标签 |
+| `atomic` | 要求单个目标上的 ref 更新使用 atomic push |
+| `crontab` | 按项目使用的 schedule 语法定时执行；留空则不定时 |
+| `timeout_secs` | Git 命令超时，默认 300 秒 |
+| `max_retries` / `retry_backoff_secs` | 失败后的额外重试次数和初始间隔，默认 3 / 5 |
+| `failure_cooldown_secs` | 所有目标持续失败时暂停定时任务，默认 60 秒 |
+| `webhook_max_pending_events` / `webhook_event_lease_secs` | Webhook 队列上限和事件租约，默认 10000 / 900 秒 |
 
-`--atomic` 只覆盖“一个目标的一次 ref push”，多个目标、LFS 传输和 SQLite 状态更新不是一个事务。
+`atomic` 只覆盖“一个目标的一次 ref push”，多个目标、LFS 传输和 SQLite 状态更新不是一个事务。
 
 ## 任务数据库模式
+
+CLI 不再接收 source、target 或任何同步配置参数。所有任务只能在 Web 页面创建和修改；CLI 只负责启动服务、执行已保存任务和维护数据库。
 
 使用 `--serve` 时，任务来自 `--database`：
 
@@ -200,7 +141,7 @@ repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --serve 127.0.0.1:8080
 - 没有 `crontab`：等待 Webhook 或页面上的“立即同步”。
 - 有 `crontab`：按计划自动入队。
 - 页面上的“立即同步”、取消、重试和启停会立即生效。
-- `--once`：把当前加载的任务各执行一次，然后退出。
+- `--once`：把当前数据库中启用的任务各执行一次，然后退出。
 
 任务数据库和 workspace 状态库是分开的：
 

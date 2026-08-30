@@ -2,8 +2,7 @@ use clap::Parser;
 use job_scheduler_ng::{Job, JobScheduler};
 use repo_sync::{
     backup_task_database, check, check_task_database, cooldown_active, list_tasks,
-    retry_event as retry_webhook, serve_webhook, status_report, sync, validate, webhook_events,
-    DivergencePolicy, Item, SyncMode, TagPolicy,
+    retry_event as retry_webhook, serve_webhook, status_report, sync, webhook_events, Item,
 };
 use std::{
     error::Error,
@@ -18,12 +17,6 @@ use std::{
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short, long, help = "source repository URL or path")]
-    source: Option<String>,
-
-    #[clap(short, long, num_args = 1.., help = "target repository URLs or paths")]
-    target: Option<Vec<String>>,
-
     #[clap(
         short = 'd',
         long,
@@ -32,65 +25,8 @@ struct Args {
     )]
     database: String,
 
-    #[clap(
-        long,
-        help = "local repository workspace; selects --retry-event from the task database"
-    )]
+    #[clap(long, help = "select a task by workspace for task-scoped commands")]
     workspace: Option<String>,
-
-    #[clap(long, value_enum, help = "sync mode: branch or mirror")]
-    mode: Option<SyncMode>,
-
-    #[clap(short, long, help = "cron schedule")]
-    crontab: Option<String>,
-
-    #[clap(long, num_args = 1.., help = "branch names or glob patterns")]
-    branches: Option<Vec<String>>,
-
-    #[clap(long, num_args = 1.., help = "full ref glob patterns to include")]
-    include_refs: Option<Vec<String>>,
-
-    #[clap(long, num_args = 1.., help = "full ref glob patterns to exclude")]
-    exclude_refs: Option<Vec<String>>,
-
-    #[clap(long, help = "sync all source branches")]
-    all_branches: bool,
-
-    #[clap(long, help = "Git command timeout in seconds")]
-    timeout_secs: Option<u64>,
-
-    #[clap(long, help = "show planned changes without writing targets")]
-    dry_run: bool,
-
-    #[clap(long, help = "allow ref deletion or forced tag/mirror updates")]
-    allow_destructive: bool,
-
-    #[clap(long, help = "sync Git LFS objects")]
-    sync_lfs: bool,
-
-    #[clap(long, value_enum, help = "branch divergence policy")]
-    divergence: Option<DivergencePolicy>,
-
-    #[clap(long, value_enum, help = "tag conflict policy")]
-    tag_policy: Option<TagPolicy>,
-
-    #[clap(long, help = "delete target branches absent from source")]
-    prune_branches: bool,
-
-    #[clap(long, help = "delete target tags absent from source")]
-    prune_tags: bool,
-
-    #[clap(long, help = "require atomic target ref updates")]
-    atomic: bool,
-
-    #[clap(long, help = "additional retries per Git command")]
-    max_retries: Option<u32>,
-
-    #[clap(long, help = "initial retry backoff in seconds")]
-    retry_backoff_secs: Option<u64>,
-
-    #[clap(long, help = "pause scheduled runs while every target is failing")]
-    failure_cooldown_secs: Option<u64>,
 
     #[clap(long, help = "validate config and repository access only")]
     check: bool,
@@ -109,12 +45,6 @@ struct Args {
         help = "listen for Webhook POST triggers and serve the embedded page"
     )]
     serve: Option<String>,
-
-    #[clap(long, help = "maximum pending webhook events per sync item")]
-    webhook_max_pending_events: Option<u64>,
-
-    #[clap(long, help = "lease for a running webhook event in seconds")]
-    webhook_event_lease_secs: Option<u64>,
 
     #[clap(long, help = "show recent webhook event history")]
     events: bool,
@@ -151,35 +81,13 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let Args {
-        source,
-        target,
         database,
         workspace,
-        mode,
-        crontab,
-        branches,
-        include_refs,
-        exclude_refs,
-        all_branches,
-        timeout_secs,
-        dry_run,
-        allow_destructive,
-        sync_lfs,
-        divergence,
-        tag_policy,
-        prune_branches,
-        prune_tags,
-        atomic,
-        max_retries,
-        retry_backoff_secs,
-        failure_cooldown_secs,
         check: check_only,
         check_write,
         status: status_only,
         json,
         serve: serve_addr,
-        webhook_max_pending_events,
-        webhook_event_lease_secs,
         events,
         retry_event,
         prune_history_days,
@@ -190,7 +98,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } = Args::parse();
     let retry_workspace = workspace.clone();
     let database_path = Path::new(&database);
-    let direct_mode = source.is_some() || target.is_some();
     let control_command = check_only
         || status_only
         || events
@@ -248,8 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("--backup-state cannot be combined with another control command".into());
     }
     if backup_tasks.is_some()
-        && (direct_mode
-            || check_only
+        && (check_only
             || status_only
             || once
             || serve_addr.is_some()
@@ -261,8 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("--backup-tasks cannot be combined with another control command".into());
     }
     if reset_admin
-        && (direct_mode
-            || check_only
+        && (check_only
             || status_only
             || once
             || serve_addr.is_some()
@@ -274,10 +179,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("--reset-admin cannot be combined with another control command".into());
     }
-    if serve_addr.is_some() && direct_mode {
-        return Err(
-            "--serve uses tasks from --database; direct sync options are not supported".into(),
-        );
+    if serve_addr.is_some() && once {
+        return Err("--serve cannot be combined with --once".into());
     }
 
     if let Some(destination) = backup_tasks {
@@ -294,85 +197,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let config = match (source, target) {
-        (Some(source), Some(target)) => {
-            if branches.is_some() && all_branches {
-                return Err("use either --branches or --all-branches".into());
-            }
-            let mode = mode.ok_or("--mode is required")?;
-            let branches = if all_branches {
-                Vec::new()
-            } else if let Some(branches) = branches {
-                branches
-            } else if matches!(mode, SyncMode::Mirror) {
-                Vec::new()
-            } else {
-                return Err("--branches or --all-branches is required in branch mode".into());
-            };
-            vec![Item {
-                source,
-                target,
-                workspace: workspace.ok_or("--workspace is required")?,
-                mode,
-                crontab,
-                branches,
-                include_refs: include_refs.unwrap_or_default(),
-                exclude_refs: exclude_refs.unwrap_or_default(),
-                timeout_secs: timeout_secs.ok_or("--timeout-secs is required")?,
-                dry_run,
-                allow_destructive,
-                sync_lfs,
-                divergence: divergence.ok_or("--divergence is required")?,
-                tag_policy: tag_policy.ok_or("--tag-policy is required")?,
-                prune_branches,
-                prune_tags,
-                atomic,
-                max_retries: max_retries.ok_or("--max-retries is required")?,
-                retry_backoff_secs: retry_backoff_secs.ok_or("--retry-backoff-secs is required")?,
-                failure_cooldown_secs: failure_cooldown_secs
-                    .ok_or("--failure-cooldown-secs is required")?,
-                webhook_secret_envs: Vec::new(),
-                webhook_max_pending_events: webhook_max_pending_events
-                    .ok_or("--webhook-max-pending-events is required")?,
-                webhook_event_lease_secs: webhook_event_lease_secs
-                    .ok_or("--webhook-event-lease-secs is required")?,
-            }]
-        }
-        (None, None)
-            if (workspace.is_none() || retry_event.is_some())
-                && mode.is_none()
-                && crontab.is_none()
-                && branches.is_none()
-                && include_refs.is_none()
-                && exclude_refs.is_none()
-                && !all_branches
-                && timeout_secs.is_none()
-                && !dry_run
-                && !allow_destructive
-                && !sync_lfs
-                && divergence.is_none()
-                && tag_policy.is_none()
-                && !prune_branches
-                && !prune_tags
-                && !atomic
-                && max_retries.is_none()
-                && retry_backoff_secs.is_none()
-                && failure_cooldown_secs.is_none()
-                && webhook_max_pending_events.is_none()
-                && webhook_event_lease_secs.is_none() =>
-        {
-            list_tasks(database_path)?
-                .into_iter()
-                .filter(|task| (control_command && retry_event.is_none()) || task.enabled)
-                .map(|task| task.item)
-                .collect()
-        }
-        _ => return Err("use either --database or all direct sync options".into()),
-    };
-
-    if !config.is_empty() {
-        validate(&config)?;
-    }
+    let config = list_tasks(database_path)?
+        .into_iter()
+        .filter(|task| {
+            ((control_command && retry_event.is_none()) || task.enabled)
+                && match workspace.as_deref() {
+                    Some(selected) => selected == task.item.workspace,
+                    None => true,
+                }
+        })
+        .map(|task| task.item)
+        .collect::<Vec<_>>();
     if check_only {
         check_task_database(database_path)?;
         for item in &config {
