@@ -81,7 +81,7 @@
 
   <p id="message" role="status" aria-live="polite"></p>
 
-  <section id="auth-panel">
+  <section id="auth-panel" hidden>
     <h2 id="auth-title">登录</h2>
     <form id="auth-form" class="form-grid">
       <label for="username">账号
@@ -247,8 +247,8 @@
 
     async function initAuth() {
       try {
-        const response = await fetch('/api/auth/status', { credentials: 'same-origin' });
-        const status = await response.json();
+        const status = await request('/api/auth/status');
+        if (typeof status.initialized !== 'boolean') throw new Error('认证状态响应无效');
         showAuth(status.initialized);
         if (status.initialized) await load();
       } catch (error) { message.textContent = `认证状态读取失败：${error.message}`; message.className = 'error'; }

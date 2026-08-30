@@ -1320,6 +1320,9 @@ fn same_origin_request(headers: &BTreeMap<String, String>) -> bool {
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| "request setup failed")?;
     let deadline = Instant::now() + REQUEST_TOTAL_TIMEOUT;
     let mut request = Vec::new();
     let mut buffer = [0; 8192];
@@ -1835,7 +1838,8 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        net::{IpAddr, Ipv4Addr},
+        io::Write,
+        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
         path::Path,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -1846,6 +1850,26 @@ mod tests {
     };
 
     type HmacSha256 = Hmac<Sha256>;
+
+    #[test]
+    fn reads_request_when_accepted_stream_is_nonblocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut client = client;
+            client
+                .write_all(b"GET /api/auth/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+        });
+
+        let request = super::read_request(&mut server).unwrap();
+        writer.join().unwrap();
+        assert_eq!(request.path, "/api/auth/status");
+    }
 
     #[test]
     fn dry_run_does_not_coalesce_webhook_events() {
