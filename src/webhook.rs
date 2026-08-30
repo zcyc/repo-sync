@@ -168,169 +168,6 @@ struct RequestError {
     message: &'static str,
 }
 
-#[derive(Default)]
-struct Metrics {
-    active_connections: AtomicU64,
-    http_requests: AtomicU64,
-    rejected_requests: AtomicU64,
-    ignored_events: AtomicU64,
-    enqueued_events: AtomicU64,
-    deduplicated_events: AtomicU64,
-    coalesced_events: AtomicU64,
-    queue_full_events: AtomicU64,
-    successful_syncs: AtomicU64,
-    failed_syncs: AtomicU64,
-    cancelled_syncs: AtomicU64,
-    sync_duration_ms_total: AtomicU64,
-    sync_duration_count: AtomicU64,
-    collection_errors: AtomicU64,
-    auth_failures: AtomicU64,
-    auth_rate_limited: AtomicU64,
-}
-
-impl Metrics {
-    fn render(&self, config: &[WebhookItem]) -> String {
-        let mut output = String::new();
-        output.push_str("# HELP repo_sync_webhook_active_connections Current webhook connections.\n# TYPE repo_sync_webhook_active_connections gauge\n");
-        output.push_str(&format!(
-            "repo_sync_webhook_active_connections {}\n",
-            self.active_connections.load(Ordering::Relaxed)
-        ));
-        counter(
-            &mut output,
-            "repo_sync_http_requests_total",
-            "HTTP requests received",
-            self.http_requests.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_rejected_total",
-            "Webhook requests rejected",
-            self.rejected_requests.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_ignored_total",
-            "Webhook events ignored",
-            self.ignored_events.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_events_enqueued_total",
-            "Webhook events enqueued",
-            self.enqueued_events.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_events_deduplicated_total",
-            "Webhook deliveries deduplicated",
-            self.deduplicated_events.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_events_coalesced_total",
-            "Webhook events coalesced after a successful sync",
-            self.coalesced_events.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_webhook_queue_full_total",
-            "Webhook requests rejected because the queue was full",
-            self.queue_full_events.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_sync_runs_succeeded_total",
-            "Successful sync runs",
-            self.successful_syncs.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_sync_runs_failed_total",
-            "Failed sync runs",
-            self.failed_syncs.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_sync_runs_cancelled_total",
-            "Cancelled sync runs",
-            self.cancelled_syncs.load(Ordering::Relaxed),
-        );
-        counter_float(
-            &mut output,
-            "repo_sync_sync_duration_seconds_sum",
-            "Total sync duration in seconds",
-            self.sync_duration_ms_total.load(Ordering::Relaxed) as f64 / 1000.0,
-        );
-        counter(
-            &mut output,
-            "repo_sync_sync_duration_seconds_count",
-            "Number of completed sync durations",
-            self.sync_duration_count.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_metrics_collection_errors_total",
-            "Metrics collection errors",
-            self.collection_errors.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_auth_failures_total",
-            "Failed administrator logins",
-            self.auth_failures.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "repo_sync_auth_rate_limited_total",
-            "Administrator logins rejected by rate limiting",
-            self.auth_rate_limited.load(Ordering::Relaxed),
-        );
-        output.push_str("# HELP repo_sync_webhook_events Current webhook events by status.\n# TYPE repo_sync_webhook_events gauge\n");
-        let mut queue_counts = BTreeMap::new();
-        let mut oldest_pending_ms = None;
-        for item in config {
-            match state::webhook_queue_stats(
-                std::path::Path::new(&item.item.workspace),
-                &item.item.source,
-            ) {
-                Ok(stats) => {
-                    for (status, count) in stats.counts {
-                        *queue_counts.entry(status).or_insert(0) += count;
-                    }
-                    oldest_pending_ms = match (oldest_pending_ms, stats.oldest_pending_ms) {
-                        (Some(left), Some(right)) => Some(left.min(right)),
-                        (None, value) | (value, None) => value,
-                    };
-                }
-                Err(error) => {
-                    self.collection_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "metrics collection failed for {}: {error}",
-                        item.item.workspace
-                    );
-                }
-            }
-        }
-        for (status, count) in queue_counts {
-            output.push_str(&format!(
-                "repo_sync_webhook_events{{status=\"{}\"}} {count}\n",
-                escape_label(&status)
-            ));
-        }
-        output.push_str(
-            "# HELP repo_sync_webhook_oldest_event_age_seconds Age of the oldest pending webhook event.\n# TYPE repo_sync_webhook_oldest_event_age_seconds gauge\n",
-        );
-        let age = oldest_pending_ms
-            .map(|received| state::now_ms().saturating_sub(received).max(0) as f64 / 1000.0)
-            .unwrap_or(0.0);
-        output.push_str(&format!(
-            "repo_sync_webhook_oldest_event_age_seconds {age:.3}\n"
-        ));
-        output
-    }
-}
-
 #[derive(Serialize)]
 struct DashboardSnapshot {
     items: Vec<DashboardItem>,
@@ -428,39 +265,19 @@ fn retry_event_task_path(path: &str) -> Option<(i64, i64)> {
     Some((task_id.parse().ok()?, event_id.parse().ok()?))
 }
 
-fn counter(output: &mut String, name: &str, help: &str, value: u64) {
-    output.push_str(&format!(
-        "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value}\n"
-    ));
-}
-
-fn counter_float(output: &mut String, name: &str, help: &str, value: f64) {
-    output.push_str(&format!(
-        "# HELP {name} {help}.\n# TYPE {name} counter\n{name} {value:.3}\n"
-    ));
-}
-
-fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
-
 pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
     let task_records = tasks::list_tasks(database_path)?;
     let config = Arc::new(RwLock::new(prepare_webhook_config(&task_records)?));
     let database_path = database_path.to_owned();
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
-    let metrics = Arc::new(Metrics::default());
+    let active_connections = Arc::new(AtomicU64::new(0));
     let (wake_sender, wake_receiver) = mpsc::channel();
     let login_limiter = Arc::new(LoginLimiter::default());
     let shutdown = Arc::new(AtomicBool::new(false));
     let reload = register_reload_flag()?;
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_config = Arc::clone(&config);
-    let worker_metrics = Arc::clone(&metrics);
     let worker_wake_sender = wake_sender.clone();
     let worker = thread::spawn(move || {
         worker_loop(
@@ -468,7 +285,6 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
             wake_receiver,
             worker_wake_sender,
             worker_shutdown,
-            worker_metrics,
         )
     });
     let shutdown_handler = Arc::clone(&shutdown);
@@ -490,11 +306,8 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
         }
         match listener.accept() {
             Ok((stream, peer)) => {
-                if metrics.active_connections.fetch_add(1, Ordering::Relaxed)
-                    >= MAX_ACTIVE_CONNECTIONS
-                {
-                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                if active_connections.fetch_add(1, Ordering::Relaxed) >= MAX_ACTIVE_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
                     let mut stream = stream;
                     write_response(
                         &mut stream,
@@ -505,7 +318,7 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
                 }
                 let config = Arc::clone(&config);
                 let database_path = database_path.clone();
-                let metrics = Arc::clone(&metrics);
+                let active_connections = Arc::clone(&active_connections);
                 let wake_sender = wake_sender.clone();
                 let login_limiter = Arc::clone(&login_limiter);
                 thread::spawn(move || {
@@ -515,10 +328,9 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
                         &config,
                         &database_path,
                         &wake_sender,
-                        &metrics,
                         &login_limiter,
                     );
-                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -575,7 +387,6 @@ fn worker_loop(
     wake_receiver: Receiver<WorkerCommand>,
     wake_sender: Sender<WorkerCommand>,
     shutdown: Arc<AtomicBool>,
-    metrics: Arc<Metrics>,
 ) {
     let mut schedule = JobScheduler::new();
     let mut schedule_signature = Vec::new();
@@ -643,7 +454,7 @@ fn worker_loop(
                 pending_tasks.remove(&task_id);
                 continue;
             };
-            if let Err(error) = process_item(&item.item, None, Some(&metrics)) {
+            if let Err(error) = process_item(&item.item, None) {
                 eprintln!("webhook worker failed for {}: {error}", item.item.workspace);
             }
             pending_tasks.remove(&task_id);
@@ -674,7 +485,7 @@ fn worker_loop(
                 else {
                     continue;
                 };
-                match enqueue_scheduled_item(&item.item, &metrics) {
+                match enqueue_scheduled_item(&item.item) {
                     Ok(true) => {
                         pending_tasks.insert(task_id, 0);
                     }
@@ -691,7 +502,7 @@ fn worker_loop(
     }
 }
 
-fn enqueue_scheduled_item(item: &Item, metrics: &Metrics) -> Result<bool, Box<dyn Error>> {
+fn enqueue_scheduled_item(item: &Item) -> Result<bool, Box<dyn Error>> {
     match state::cooldown_active(
         Path::new(&item.workspace),
         &item.source,
@@ -713,7 +524,6 @@ fn enqueue_scheduled_item(item: &Item, metrics: &Metrics) -> Result<bool, Box<dy
     )? {
         WebhookEnqueue::Enqueued => Ok(true),
         WebhookEnqueue::Full => {
-            metrics.queue_full_events.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "scheduled sync {} skipped because the queue is full",
                 item.workspace
@@ -724,30 +534,11 @@ fn enqueue_scheduled_item(item: &Item, metrics: &Metrics) -> Result<bool, Box<dy
     }
 }
 
-fn record_sync_metrics(metrics: &Metrics, started: Instant, result: &Result<(), Box<dyn Error>>) {
-    metrics.sync_duration_ms_total.fetch_add(
-        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        Ordering::Relaxed,
-    );
-    metrics.sync_duration_count.fetch_add(1, Ordering::Relaxed);
-    match result {
-        Ok(()) => metrics.successful_syncs.fetch_add(1, Ordering::Relaxed),
-        Err(error) if error.to_string() == "sync cancelled" => {
-            metrics.cancelled_syncs.fetch_add(1, Ordering::Relaxed)
-        }
-        Err(_) => metrics.failed_syncs.fetch_add(1, Ordering::Relaxed),
-    };
-}
-
 fn should_coalesce_webhook_events(finished: bool, result_ok: bool, dry_run: bool) -> bool {
     finished && result_ok && !dry_run
 }
 
-fn process_item(
-    item: &Item,
-    event_id: Option<i64>,
-    metrics: Option<&Metrics>,
-) -> Result<(), Box<dyn Error>> {
+fn process_item(item: &Item, event_id: Option<i64>) -> Result<(), Box<dyn Error>> {
     let workspace = std::path::Path::new(&item.workspace);
     let mut db = StateDb::open(workspace, &item.source)?;
     loop {
@@ -798,14 +589,10 @@ fn process_item(
                 }
             }
         });
-        let started = Instant::now();
         let result = sync::sync(item);
         let _ = stop_heartbeat.send(());
         let _ = heartbeat.join();
         let error = result.as_ref().err().map(ToString::to_string);
-        if let Some(metrics) = metrics {
-            record_sync_metrics(metrics, started, &result);
-        }
         let retry_after =
             state::now_ms().saturating_add(event_retry_delay(item.retry_backoff_secs, attempts));
         let finished = db.finish_webhook_event(
@@ -817,13 +604,7 @@ fn process_item(
         )?;
         if should_coalesce_webhook_events(finished, result.is_ok(), item.dry_run) {
             // A successful non-dry-run full-state sync makes queued notifications redundant.
-            let coalesced =
-                db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
-            if let Some(metrics) = metrics {
-                metrics
-                    .coalesced_events
-                    .fetch_add(coalesced as u64, Ordering::Relaxed);
-            }
+            db.coalesce_webhook_events(&item.source, claimed_id, state::now_ms())?;
         }
         if event_id.is_some() {
             return result;
@@ -848,14 +629,11 @@ fn handle_connection(
     config_store: &RwLock<Vec<WebhookItem>>,
     database_path: &Path,
     wake_sender: &Sender<WorkerCommand>,
-    metrics: &Metrics,
     login_limiter: &LoginLimiter,
 ) {
-    metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
-            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(&mut stream, "400 Bad Request", error);
             return;
         }
@@ -867,19 +645,6 @@ fn handle_connection(
     }
     if request.method == "GET" && path == "/readyz" {
         write_response(&mut stream, "200 OK", "ready");
-        return;
-    }
-    if request.method == "GET" && path == "/metrics" {
-        let config = config_store
-            .read()
-            .expect("webhook config lock poisoned")
-            .clone();
-        write_response_with_type(
-            &mut stream,
-            "200 OK",
-            "text/plain; version=0.0.4; charset=utf-8",
-            &metrics.render(&config),
-        );
         return;
     }
     if request.method == "GET" && path == "/" {
@@ -895,7 +660,6 @@ fn handle_connection(
         && path.starts_with("/api/")
         && !same_origin_request(&request.headers)
     {
-        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
         write_response(
             &mut stream,
             "403 Forbidden",
@@ -910,7 +674,6 @@ fn handle_connection(
             database_path,
             &request,
             path,
-            metrics,
             login_limiter,
         );
         return;
@@ -923,7 +686,6 @@ fn handle_connection(
                 .is_some()
         });
         if !authenticated {
-            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(&mut stream, "401 Unauthorized", "login required");
             return;
         }
@@ -1162,7 +924,6 @@ fn handle_connection(
             }
             ("PUT", task_path) => {
                 let Some(task_id) = task_id_path(task_path) else {
-                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
                 };
@@ -1216,7 +977,6 @@ fn handle_connection(
             }
             ("DELETE", task_path) => {
                 let Some(task_id) = task_id_path(task_path) else {
-                    metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
                 };
@@ -1247,14 +1007,12 @@ fn handle_connection(
                 }
             }
             _ => {
-                metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 write_response(&mut stream, "404 Not Found", "unknown dashboard endpoint");
             }
         }
         return;
     }
     if request.method != "POST" {
-        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "405 Method Not Allowed", "POST required");
         return;
     }
@@ -1265,13 +1023,11 @@ fn handle_connection(
     let event = match parse_event(&request.headers, &request.body) {
         Ok(event) => event,
         Err(error) => {
-            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(&mut stream, error.status, error.message);
             return;
         }
     };
     let Some(event) = event else {
-        metrics.ignored_events.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "202 Accepted", "event ignored");
         return;
     };
@@ -1324,15 +1080,10 @@ fn handle_connection(
             item.webhook_max_pending_events,
         ) {
             Ok(WebhookEnqueue::Enqueued) => {
-                metrics.enqueued_events.fetch_add(1, Ordering::Relaxed);
                 let _ = wake_sender.send(WorkerCommand::Webhook(webhook_item.task_id));
             }
-            Ok(WebhookEnqueue::Duplicate) => {
-                metrics.deduplicated_events.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(WebhookEnqueue::Duplicate) => {}
             Ok(WebhookEnqueue::Full) => {
-                metrics.queue_full_events.fetch_add(1, Ordering::Relaxed);
-                metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 eprintln!("webhook queue is full for {}", item.workspace);
                 queue_full = true;
             }
@@ -1344,7 +1095,6 @@ fn handle_connection(
         }
     }
     if matched && !authenticated {
-        metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
         let message = match event.provider {
             "github" => "invalid GitHub signature",
             "gitlab" => "invalid GitLab signature",
@@ -1364,7 +1114,6 @@ fn handle_connection(
     if matched {
         write_response(&mut stream, "202 Accepted", "sync queued");
     } else {
-        metrics.ignored_events.fetch_add(1, Ordering::Relaxed);
         write_response(&mut stream, "202 Accepted", "event ignored");
     }
 }
@@ -1375,7 +1124,6 @@ fn handle_auth_request(
     database_path: &Path,
     request: &HttpRequest,
     path: &str,
-    metrics: &Metrics,
     login_limiter: &LoginLimiter,
 ) {
     match (request.method.as_str(), path) {
@@ -1423,7 +1171,6 @@ fn handle_auth_request(
         }
         ("POST", "/api/auth/login") => {
             if !login_limiter.allowed(peer.ip()) {
-                metrics.auth_rate_limited.fetch_add(1, Ordering::Relaxed);
                 write_response_with_headers(
                     stream,
                     "429 Too Many Requests",
@@ -1438,7 +1185,6 @@ fn handle_auth_request(
                 Err(error) => {
                     eprintln!("auth login request failed: {error}");
                     login_limiter.record_failure(peer.ip());
-                    metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                     write_response(stream, "400 Bad Request", "invalid credentials");
                     return;
                 }
@@ -1455,7 +1201,6 @@ fn handle_auth_request(
                 }
                 Err(_) => {
                     login_limiter.record_failure(peer.ip());
-                    metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                     write_response(stream, "401 Unauthorized", "invalid credentials");
                 }
             }
@@ -1511,7 +1256,6 @@ fn handle_auth_request(
             );
         }
         _ => {
-            metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
             write_response(stream, "404 Not Found", "unknown auth endpoint");
         }
     }
@@ -2080,9 +1824,9 @@ fn write_response_with_cookie_and_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_label, parse_event, parse_headers, request_header_end, same_origin_request,
-        secure_cookie, session_cookie, should_coalesce_webhook_events, verify_event,
-        verify_github_signature, verify_gitlab_signature, LoginLimiter, Metrics,
+        parse_event, parse_headers, request_header_end, same_origin_request, secure_cookie,
+        session_cookie, should_coalesce_webhook_events, verify_event, verify_github_signature,
+        verify_gitlab_signature, LoginLimiter,
     };
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2377,9 +2121,8 @@ mod tests {
         let (wake_sender, wake_receiver) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let metrics = Arc::new(Metrics::default());
         let worker = thread::spawn(move || {
-            super::worker_loop(config, wake_receiver, wake_sender, worker_shutdown, metrics)
+            super::worker_loop(config, wake_receiver, wake_sender, worker_shutdown)
         });
 
         thread::sleep(Duration::from_millis(2_500));
@@ -2401,16 +2144,6 @@ mod tests {
         .unwrap();
         assert!(missing_events[0].attempts >= 1);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn renders_prometheus_metrics_and_escapes_labels() {
-        let metrics = Metrics::default();
-        metrics.http_requests.fetch_add(3, Ordering::Relaxed);
-        let output = metrics.render(&[]);
-        assert!(output.contains("# TYPE repo_sync_http_requests_total counter"));
-        assert!(output.contains("repo_sync_http_requests_total 3"));
-        assert_eq!(escape_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
     }
 
     #[test]

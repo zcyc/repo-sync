@@ -181,10 +181,9 @@ repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --serve 127.0.0.1:8080
 | `GET /` | 管理页面 |
 | `GET /healthz` | 存活检查 |
 | `GET /readyz` | 就绪检查 |
-| `GET /metrics` | Prometheus 文本指标 |
 | `POST /webhook` | GitHub/GitLab Webhook；POST 路径可使用反向代理统一规划 |
 
-listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在已有 TLS 反向代理后面，并限制 `/metrics` 的访问范围。配置更新后发送 `SIGHUP` 可重新加载任务和轮换 secret，无需停止进程。
+listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在已有 TLS 反向代理后面。配置更新后发送 `SIGHUP` 可重新加载任务和轮换 secret，无需停止进程。
 
 ## 状态与维护
 
