@@ -10,7 +10,7 @@
 | --- | --- |
 | 长期运行、管理多个任务 | `--serve` + Web 管理页面 |
 | 手动执行任务 | Web 页面中的“立即同步” |
-| 查看状态或维护 SQLite | `--status`、`--events`、`--backup-*` 等维护命令 |
+| 检查或维护 SQLite | `--check`、`--backup-*` 等维护命令 |
 
 任务配置只存 SQLite，不读取 `config.toml`、JSON 或 TOML 配置文件。
 
@@ -188,16 +188,12 @@ listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在�
 
 ## 状态与维护
 
+状态、Webhook 事件、队列和最近运行记录统一在 Web 页面查看；任务的创建、修改、立即执行、取消和重试也只在 Web 页面完成。
+
 ```sh
-# 文本状态
-repo-sync --database ./repo-sync-tasks.sqlite3 --status
-
-# JSON 状态，适合脚本和监控
-repo-sync --database ./repo-sync-tasks.sqlite3 --status --json
-
-# 每个 workspace 最近 50 条 Webhook 事件
-repo-sync --database ./repo-sync-tasks.sqlite3 --events
-repo-sync --database ./repo-sync-tasks.sqlite3 --events --json
+# 检查任务配置、workspace 和仓库访问
+repo-sync --database ./repo-sync-tasks.sqlite3 --check
+repo-sync --database ./repo-sync-tasks.sqlite3 --check --check-write
 
 # 只删除已结束且超过 30 天的历史；最小值为 7
 repo-sync --database ./repo-sync-tasks.sqlite3 --prune-history-days 30
