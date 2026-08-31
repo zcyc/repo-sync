@@ -4,85 +4,197 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#f2eee8">
   <title>repo-sync</title>
   <style>
-    :root { font-family: system-ui, sans-serif; color: #172033; background: #f4f6fa; }
-    body { max-width: 1280px; margin: 0 auto; padding: 2rem 1rem 4rem; }
-    header, section { background: #fff; border: 1px solid #dfe4ec; border-radius: 12px; padding: 1rem; margin-block: 1rem; box-shadow: 0 2px 10px #1720330b; }
-    header { display: flex; gap: 1rem; align-items: end; justify-content: space-between; flex-wrap: wrap; }
-    h1, h2 { margin: 0 0 .75rem; }
-    h1 { font-size: 1.6rem; }
-    h2 { font-size: 1.1rem; }
-    .controls, .actions { display: flex; gap: .5rem; align-items: end; flex-wrap: wrap; }
-    label { display: grid; gap: .25rem; font-size: .85rem; }
-    input, textarea, select, button { font: inherit; border: 1px solid #b9c2d1; border-radius: 8px; padding: .55rem .7rem; }
-    input[type="checkbox"] { width: 1rem; height: 1rem; }
+    :root {
+      color-scheme: light;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      color: #2b2926;
+      background: #f2eee8;
+      --bg: #f2eee8;
+      --surface: #fffdf9;
+      --surface-solid: #fffdf9;
+      --surface-soft: #f7f2eb;
+      --line: #e2dbd1;
+      --line-strong: #cfc5b8;
+      --text: #2b2926;
+      --muted: #756f66;
+      --primary: #b45f42;
+      --primary-strong: #974b32;
+      --primary-soft: #f6e5dc;
+      --teal: #5e7c68;
+      --danger: #ad4545;
+      --shadow: 0 10px 30px rgba(75, 57, 42, .08);
+      --shadow-sm: 0 5px 15px rgba(75, 57, 42, .08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      min-height: 100vh;
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 2rem clamp(1rem, 3vw, 3.75rem) 5rem;
+      background: var(--bg);
+    }
+    header, section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: clamp(1.1rem, 2vw, 1.7rem);
+      margin-block: 1rem;
+      box-shadow: var(--shadow);
+    }
+    header {
+      display: flex;
+      gap: 2rem;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.25rem clamp(1.1rem, 2vw, 1.7rem);
+    }
+    h1, h2, p { margin-top: 0; }
+    h1 { margin-bottom: .22rem; font-size: clamp(1.65rem, 3vw, 2.15rem); letter-spacing: -.045em; }
+    h2 { margin-bottom: .15rem; font-size: 1.05rem; letter-spacing: -.02em; }
+    .brand { display: flex; align-items: center; gap: .85rem; min-width: 15rem; }
+    .brand-mark {
+      display: grid;
+      flex: 0 0 3.15rem;
+      place-items: center;
+      width: 3.15rem;
+      height: 3.15rem;
+      border-radius: .75rem;
+      color: #fff;
+      background: var(--primary);
+      box-shadow: 0 7px 14px rgba(180, 95, 66, .2);
+      font-size: 1.6rem;
+      font-weight: 800;
+    }
+    .eyebrow { color: var(--primary); font-size: .68rem; font-weight: 800; letter-spacing: .1em; }
+    .subtitle { margin: 0; color: var(--muted); font-size: .88rem; }
+    .header-tools { display: grid; gap: .6rem; justify-items: end; }
+    .header-meta { display: flex; gap: .4rem; align-items: center; color: var(--muted); font-size: .78rem; }
+    .status-dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 .25rem rgba(94, 124, 104, .14); }
+    .controls, .actions { display: flex; gap: .55rem; align-items: end; flex-wrap: wrap; }
+    .controls { justify-content: end; }
+    label { display: grid; gap: .38rem; color: var(--muted); font-size: .78rem; font-weight: 700; letter-spacing: .01em; }
+    input, textarea, select, button { font: inherit; border: 1px solid var(--line-strong); border-radius: 10px; padding: .64rem .75rem; }
+    input, textarea, select { width: 100%; color: var(--text); background: var(--surface-solid); transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease; }
+    input::placeholder, textarea::placeholder { color: #9c9489; }
+    input:hover, textarea:hover, select:hover { border-color: #b9ad9f; }
+    input:focus, textarea:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(180, 95, 66, .14); outline: 0; }
+    input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: var(--primary); }
     input[type="number"] { width: 8rem; }
-    input, textarea, select { width: 100%; box-sizing: border-box; }
     input#username, input#password, input#password-confirm, input#task-filter { min-width: 16rem; width: auto; }
     textarea { min-height: 5rem; resize: vertical; }
-    button { cursor: pointer; background: #1d5fd1; border-color: #1d5fd1; color: #fff; }
-    button.secondary { background: #fff; color: #172033; }
-    button.danger { background: #ae2535; border-color: #ae2535; }
-    button:disabled { cursor: not-allowed; opacity: .55; }
-    :focus-visible { outline: 3px solid #77a7ff; outline-offset: 2px; }
-    #message { min-height: 1.4rem; margin: 0; }
-    .error { color: #ae2535; }
-    .muted { color: #5c687b; }
-    .table-wrap { overflow-x: auto; }
+    button { cursor: pointer; color: #fff; background: var(--primary); border-color: var(--primary); box-shadow: 0 5px 12px rgba(180, 95, 66, .16); font-weight: 700; transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease; }
+    button:hover { background: var(--primary-strong); box-shadow: 0 8px 18px rgba(180, 95, 66, .2); transform: translateY(-1px); }
+    button.secondary { color: var(--text); background: var(--surface-solid); border-color: var(--line-strong); box-shadow: none; }
+    button.secondary:hover { border-color: #b9ad9f; background: var(--surface-soft); box-shadow: var(--shadow-sm); }
+    button.danger { color: var(--danger); background: #fff4f1; border-color: #e8cbc0; box-shadow: none; }
+    button.danger:hover { background: #fbe8df; }
+    button:disabled { cursor: not-allowed; opacity: .55; transform: none; }
+    :focus-visible { outline: 3px solid #c77d61; outline-offset: 2px; }
+    #message { min-height: 1.4rem; margin: 1rem .15rem; color: var(--muted); font-size: .82rem; }
+    #message:not(:empty) { padding: .7rem .85rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, .62); }
+    .error { color: var(--danger) !important; border-color: #e9c6c1 !important; background: #fff4f1 !important; }
+    .muted { color: var(--muted); }
+    .panel-heading, .task-toolbar { display: flex; gap: 1rem; align-items: center; justify-content: space-between; margin-bottom: 1.2rem; }
+    .section-caption { margin: .28rem 0 0; color: var(--muted); font-size: .8rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-solid); -webkit-overflow-scrolling: touch; }
     table { border-collapse: collapse; width: 100%; min-width: 1120px; }
-    th, td { text-align: left; border-bottom: 1px solid #e7eaf0; padding: .7rem .5rem; vertical-align: top; }
-    th { color: #5c687b; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: .85rem .65rem; vertical-align: top; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: var(--surface-soft); }
+    th { color: var(--muted); background: var(--surface-soft); font-size: .68rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+    th:first-child { border-radius: 13px 0 0 0; }
+    th:last-child { border-radius: 0 13px 0 0; }
     code, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-    .pill { display: inline-block; border-radius: 999px; padding: .15rem .5rem; background: #e7eefc; color: #214b96; font-size: .85rem; }
-    .pill.off { background: #eceef2; color: #5c687b; }
-    .form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; }
+    td, td code { font-size: .8rem; line-height: 1.55; }
+    td strong { font-size: .84rem; }
+    td.actions { min-width: 11.5rem; align-items: stretch; }
+    td.actions button { padding: .48rem .58rem; font-size: .72rem; }
+    .pill { display: inline-flex; align-items: center; gap: .25rem; border-radius: 999px; padding: .22rem .58rem; color: var(--primary-strong); background: var(--primary-soft); font-size: .72rem; font-weight: 800; }
+    .pill::before { content: ""; width: .35rem; height: .35rem; border-radius: 50%; background: currentColor; }
+    .pill.off { color: var(--muted); background: #eeeae4; }
+    .form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
     .wide { grid-column: span 2; }
     .full { grid-column: 1 / -1; }
-    .checks { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
-    .checks label { display: flex; align-items: center; gap: .35rem; }
-    details { margin-top: 1rem; }
-    summary { cursor: pointer; font-weight: 600; margin-bottom: 1rem; }
-    @media (max-width: 800px) { .form-grid { grid-template-columns: 1fr; } .wide, .full { grid-column: auto; } }
+    .checks { display: flex; gap: .8rem 1.15rem; align-items: center; flex-wrap: wrap; padding: .2rem 0 .35rem; }
+    .checks label { display: flex; align-items: center; gap: .4rem; color: var(--text); font-size: .8rem; font-weight: 600; }
+    details { margin-top: 1.25rem; border-top: 1px solid var(--line); padding-top: .9rem; }
+    summary { cursor: pointer; color: var(--text); font-size: .8rem; font-weight: 800; list-style-position: inside; }
+    details[open] summary { margin-bottom: 1.1rem; }
+    .auth-card { max-width: 54rem; margin-inline: auto; }
+    .auth-card .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .auth-card .actions { justify-content: end; }
+    @media (max-width: 900px) {
+      header { align-items: stretch; flex-direction: column; }
+      .header-tools, .controls { justify-items: stretch; justify-content: stretch; }
+      .form-grid, .auth-card .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls label:first-child { flex: 1 1 15rem; }
+    }
+    @media (max-width: 620px) {
+      body { padding: 1rem .75rem 3rem; }
+      header, section { border-radius: 16px; padding: 1rem; }
+      .brand { min-width: 0; }
+      .brand-mark { flex-basis: 2.65rem; width: 2.65rem; height: 2.65rem; border-radius: .65rem; }
+      .form-grid, .auth-card .form-grid { grid-template-columns: 1fr; }
+      .wide, .full { grid-column: auto; }
+      input#username, input#password, input#password-confirm, input#task-filter { min-width: 0; width: 100%; }
+      .task-toolbar, .panel-heading { align-items: flex-start; flex-direction: column; }
+      .task-toolbar .actions { width: 100%; }
+      .task-toolbar .actions > * { flex: 1; }
+      .auth-card .actions { justify-content: stretch; }
+      .auth-card .actions button { width: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
     @media (prefers-color-scheme: dark) {
-      :root { color: #e7edf8; background: #101827; }
-      header, section { background: #172235; border-color: #30405b; }
-      input, textarea, select, button.secondary { background: #172235; color: #e7edf8; border-color: #536581; }
-      textarea { background: #101827; }
-      th, td { border-color: #30405b; }
-      .muted { color: #a9b6ca; }
-      .pill.off { background: #30405b; color: #a9b6ca; }
+      :root { color-scheme: dark; color: #f1ece5; background: #191715; --bg: #191715; --surface: #24211e; --surface-solid: #24211e; --surface-soft: #2c2824; --line: #413b35; --line-strong: #5a5047; --text: #f1ece5; --muted: #b8aca0; --primary: #d47c5b; --primary-strong: #e08b69; --primary-soft: #493027; --teal: #91b29a; --danger: #e08378; --shadow: 0 18px 44px rgba(0, 0, 0, .24); --shadow-sm: 0 7px 18px rgba(0, 0, 0, .2); }
+      input::placeholder, textarea::placeholder { color: #887c71; }
+      button.secondary { background: var(--surface-solid); }
+      button.danger, .error { background: #3a2522 !important; border-color: #74413a !important; }
+      .pill.off { background: #413b35; color: #b8aca0; }
+      #message:not(:empty) { background: var(--surface-solid); }
     }
   </style>
 </head>
 <body>
   <header>
-    <div>
-      <h1>repo-sync</h1>
-      <p class="muted">SQLite 任务、同步状态和 Webhook 队列</p>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">↔</div>
+      <div>
+        <span class="eyebrow">同步控制台</span>
+        <h1>repo-sync</h1>
+        <p class="subtitle">SQLite 任务、同步状态和 Webhook 队列</p>
+      </div>
     </div>
-    <div class="controls">
-      <label for="task-filter">筛选任务
-        <input id="task-filter" type="search" placeholder="ID、源仓库或 Workspace" autocomplete="off">
-      </label>
-      <label for="status-filter">状态
-        <select id="status-filter">
-          <option value="all">全部</option>
-          <option value="enabled">启用</option>
-          <option value="disabled">停用</option>
-          <option value="failed">失败</option>
-          <option value="queued">有待处理事件</option>
-        </select>
-      </label>
-      <button id="refresh" class="secondary" type="button">刷新</button>
-      <button id="logout" class="secondary" type="button" hidden>退出登录</button>
+    <div class="header-tools">
+      <div class="header-meta"><span class="status-dot"></span>服务在线 · 每 5 秒自动更新</div>
+      <div class="controls">
+        <label for="task-filter">筛选任务
+          <input id="task-filter" type="search" placeholder="ID、源仓库或 Workspace" autocomplete="off">
+        </label>
+        <label for="status-filter">状态
+          <select id="status-filter">
+            <option value="all">全部</option>
+            <option value="enabled">启用</option>
+            <option value="disabled">停用</option>
+            <option value="failed">失败</option>
+            <option value="queued">有待处理事件</option>
+          </select>
+        </label>
+        <button id="logout" class="secondary" type="button" hidden>退出登录</button>
+      </div>
     </div>
   </header>
 
   <p id="message" role="status" aria-live="polite"></p>
 
-  <section id="auth-panel" hidden>
-    <h2 id="auth-title">登录</h2>
+  <section id="auth-panel" class="auth-card" hidden>
+    <div class="panel-heading"><div><span class="eyebrow">安全登录</span><h2 id="auth-title">登录</h2><p class="section-caption">使用管理员账号进入同步控制台</p></div></div>
     <form id="auth-form" class="form-grid">
       <label for="username">账号
         <input id="username" name="username" required maxlength="64" autocomplete="username">
@@ -99,7 +211,7 @@
 
   <main id="app" hidden>
   <section>
-    <h2>账号安全</h2>
+    <div class="panel-heading"><div><span class="eyebrow">账号设置</span><h2>账号安全</h2><p class="section-caption">定期更新凭据，保护任务配置和运行权限</p></div></div>
     <form id="password-form" class="form-grid">
       <label for="current-password">当前密码
         <input id="current-password" name="current-password" type="password" required minlength="12" maxlength="256" autocomplete="current-password">
@@ -115,9 +227,9 @@
   </section>
 
   <section>
-    <div class="actions">
-      <h2 style="margin-right:auto">同步任务</h2>
-      <button id="new-task" type="button">新建任务</button>
+    <div class="task-toolbar">
+      <div><span class="eyebrow">任务列表</span><h2>同步任务</h2><p class="section-caption">管理仓库镜像、定时运行和 Webhook 队列</p></div>
+      <div class="actions"><button id="new-task" type="button">新建任务</button></div>
     </div>
     <div class="table-wrap">
       <table>
@@ -128,7 +240,7 @@
   </section>
 
   <section>
-    <h2 id="editor-title">新建同步任务</h2>
+    <div class="panel-heading"><div><span class="eyebrow">任务配置</span><h2 id="editor-title">新建同步任务</h2><p class="section-caption">保存后配置会立即生效</p></div></div>
     <form id="task-form">
       <input id="task-id" type="hidden">
       <div class="form-grid">
@@ -217,7 +329,6 @@
     const tasks = document.querySelector('#tasks');
     const form = document.querySelector('#task-form');
     const editorTitle = document.querySelector('#editor-title');
-    const refresh = document.querySelector('#refresh');
     const taskFilter = document.querySelector('#task-filter');
     const statusFilter = document.querySelector('#status-filter');
     let taskRecords = [];
@@ -411,7 +522,6 @@
 
     document.querySelector('#new-task').addEventListener('click', () => { setForm(); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); });
     document.querySelector('#cancel').addEventListener('click', () => setForm());
-    refresh.addEventListener('click', load);
     taskFilter.addEventListener('input', render);
     statusFilter.addEventListener('change', render);
     logout.addEventListener('click', async () => {

@@ -20,7 +20,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -100,7 +100,6 @@ struct WebhookItem {
 }
 
 enum WorkerCommand {
-    ConfigChanged,
     Webhook(i64),
     Scheduled(i64),
 }
@@ -231,14 +230,8 @@ fn dashboard_snapshot(config: &[WebhookItem]) -> Result<String, Box<dyn Error>> 
     Ok(serde_json::to_string(&DashboardSnapshot { items })?)
 }
 
-fn reload_task_config(
-    database_path: &Path,
-    config_store: &RwLock<Vec<WebhookItem>>,
-) -> Result<(), Box<dyn Error>> {
-    let task_records = tasks::list_tasks(database_path)?;
-    let prepared = prepare_webhook_config(&task_records)?;
-    *config_store.write().expect("webhook config lock poisoned") = prepared;
-    Ok(())
+fn load_webhook_config(database_path: &Path) -> Result<Vec<WebhookItem>, Box<dyn Error>> {
+    prepare_webhook_config(&tasks::list_tasks(database_path)?)
 }
 
 fn task_id_path(path: &str) -> Option<i64> {
@@ -266,8 +259,6 @@ fn retry_event_task_path(path: &str) -> Option<(i64, i64)> {
 }
 
 pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
-    let task_records = tasks::list_tasks(database_path)?;
-    let config = Arc::new(RwLock::new(prepare_webhook_config(&task_records)?));
     let database_path = database_path.to_owned();
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
@@ -275,13 +266,12 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
     let (wake_sender, wake_receiver) = mpsc::channel();
     let login_limiter = Arc::new(LoginLimiter::default());
     let shutdown = Arc::new(AtomicBool::new(false));
-    let reload = register_reload_flag()?;
     let worker_shutdown = Arc::clone(&shutdown);
-    let worker_config = Arc::clone(&config);
+    let worker_database_path = database_path.clone();
     let worker_wake_sender = wake_sender.clone();
     let worker = thread::spawn(move || {
         worker_loop(
-            worker_config,
+            worker_database_path,
             wake_receiver,
             worker_wake_sender,
             worker_shutdown,
@@ -292,18 +282,6 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
 
     eprintln!("webhook listener started on {addr}");
     while !shutdown.load(Ordering::Relaxed) {
-        if reload.swap(false, Ordering::Relaxed) {
-            match tasks::list_tasks(&database_path)
-                .and_then(|new_tasks| prepare_webhook_config(&new_tasks))
-            {
-                Ok(new_config) => {
-                    *config.write().expect("webhook config lock poisoned") = new_config;
-                    let _ = wake_sender.send(WorkerCommand::ConfigChanged);
-                    eprintln!("webhook tasks reloaded from {}", database_path.display());
-                }
-                Err(error) => eprintln!("webhook task reload failed: {error}"),
-            }
-        }
         match listener.accept() {
             Ok((stream, peer)) => {
                 if active_connections.fetch_add(1, Ordering::Relaxed) >= MAX_ACTIVE_CONNECTIONS {
@@ -316,20 +294,12 @@ pub fn serve(addr: &str, database_path: &Path) -> Result<(), Box<dyn Error>> {
                     );
                     continue;
                 }
-                let config = Arc::clone(&config);
                 let database_path = database_path.clone();
                 let active_connections = Arc::clone(&active_connections);
                 let wake_sender = wake_sender.clone();
                 let login_limiter = Arc::clone(&login_limiter);
                 thread::spawn(move || {
-                    handle_connection(
-                        stream,
-                        peer,
-                        &config,
-                        &database_path,
-                        &wake_sender,
-                        &login_limiter,
-                    );
+                    handle_connection(stream, peer, &database_path, &wake_sender, &login_limiter);
                     active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -375,24 +345,36 @@ fn prepare_webhook_config(task_records: &[Task]) -> Result<Vec<WebhookItem>, Box
         .collect()
 }
 
-fn register_reload_flag() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
-    let flag = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&flag))?;
-    Ok(flag)
-}
-
 fn worker_loop(
-    config: Arc<RwLock<Vec<WebhookItem>>>,
+    database_path: std::path::PathBuf,
     wake_receiver: Receiver<WorkerCommand>,
     wake_sender: Sender<WorkerCommand>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let task_db = match tasks::TaskDb::open(&database_path) {
+        Ok(task_db) => task_db,
+        Err(error) => {
+            eprintln!("webhook task database unavailable: {error}");
+            return;
+        }
+    };
     let mut schedule = JobScheduler::new();
     let mut schedule_signature = Vec::new();
     let mut pending_tasks = BTreeMap::new();
     while !shutdown.load(Ordering::Relaxed) {
-        let items = config.read().expect("webhook config lock poisoned").clone();
+        let items = match task_db
+            .list()
+            .and_then(|task_records| prepare_webhook_config(&task_records))
+        {
+            Ok(items) => items,
+            Err(error) => {
+                eprintln!("webhook task read failed: {error}");
+                match wake_receiver.recv_timeout(Duration::from_millis(500)) {
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+                }
+            }
+        };
         let next_signature = items
             .iter()
             .map(|item| {
@@ -474,7 +456,6 @@ fn worker_loop(
             }
         }
         match wake_receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok(WorkerCommand::ConfigChanged) => {}
             Ok(WorkerCommand::Webhook(task_id)) => {
                 pending_tasks.insert(task_id, 0);
             }
@@ -626,7 +607,6 @@ fn event_retry_delay(backoff_secs: u64, attempts: i64) -> i64 {
 fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
-    config_store: &RwLock<Vec<WebhookItem>>,
     database_path: &Path,
     wake_sender: &Sender<WorkerCommand>,
     login_limiter: &LoginLimiter,
@@ -691,11 +671,9 @@ fn handle_connection(
         }
         match (request.method.as_str(), path) {
             ("GET", "/api/status") => {
-                let config = config_store
-                    .read()
-                    .expect("webhook config lock poisoned")
-                    .clone();
-                match dashboard_snapshot(&config) {
+                match load_webhook_config(database_path)
+                    .and_then(|config| dashboard_snapshot(&config))
+                {
                     Ok(body) => write_response_with_type(
                         &mut stream,
                         "200 OK",
@@ -744,32 +722,19 @@ fn handle_connection(
                     &task_request.item,
                     task_request.enabled,
                 ) {
-                    Ok(task) => match reload_task_config(database_path, config_store) {
-                        Ok(()) => {
-                            let _ = wake_sender.send(WorkerCommand::ConfigChanged);
-                            match serde_json::to_string(&task) {
-                                Ok(body) => write_response_with_type(
-                                    &mut stream,
-                                    "201 Created",
-                                    "application/json; charset=utf-8",
-                                    &body,
-                                ),
-                                Err(error) => {
-                                    eprintln!("dashboard task serialization failed: {error}");
-                                    write_response(
-                                        &mut stream,
-                                        "500 Internal Server Error",
-                                        "task unavailable",
-                                    );
-                                }
-                            }
-                        }
+                    Ok(task) => match serde_json::to_string(&task) {
+                        Ok(body) => write_response_with_type(
+                            &mut stream,
+                            "201 Created",
+                            "application/json; charset=utf-8",
+                            &body,
+                        ),
                         Err(error) => {
-                            eprintln!("dashboard task reload failed: {error}");
+                            eprintln!("dashboard task serialization failed: {error}");
                             write_response(
                                 &mut stream,
                                 "500 Internal Server Error",
-                                "task reload failed",
+                                "task unavailable",
                             );
                         }
                     },
@@ -785,12 +750,18 @@ fn handle_connection(
             },
             ("POST", task_path) if run_task_id_path(task_path).is_some() => {
                 let task_id = run_task_id_path(task_path).expect("checked task id path");
-                let task = config_store
-                    .read()
-                    .expect("webhook config lock poisoned")
-                    .iter()
-                    .find(|item| item.task_id == task_id)
-                    .cloned();
+                let task = match load_webhook_config(database_path) {
+                    Ok(config) => config.into_iter().find(|item| item.task_id == task_id),
+                    Err(error) => {
+                        eprintln!("dashboard task read failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "tasks unavailable",
+                        );
+                        return;
+                    }
+                };
                 let Some(task) = task else {
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
@@ -843,12 +814,21 @@ fn handle_connection(
             }
             ("POST", task_path) if cancel_task_id_path(task_path).is_some() => {
                 let task_id = cancel_task_id_path(task_path).expect("checked task id path");
-                let item = config_store
-                    .read()
-                    .expect("webhook config lock poisoned")
-                    .iter()
-                    .find(|item| item.task_id == task_id)
-                    .map(|item| item.item.clone());
+                let item = match load_webhook_config(database_path) {
+                    Ok(config) => config
+                        .into_iter()
+                        .find(|item| item.task_id == task_id)
+                        .map(|item| item.item),
+                    Err(error) => {
+                        eprintln!("dashboard task read failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "tasks unavailable",
+                        );
+                        return;
+                    }
+                };
                 let Some(item) = item else {
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
@@ -880,12 +860,18 @@ fn handle_connection(
             ("POST", task_path) if retry_event_task_path(task_path).is_some() => {
                 let (task_id, event_id) =
                     retry_event_task_path(task_path).expect("checked event retry path");
-                let task = config_store
-                    .read()
-                    .expect("webhook config lock poisoned")
-                    .iter()
-                    .find(|item| item.task_id == task_id)
-                    .cloned();
+                let task = match load_webhook_config(database_path) {
+                    Ok(config) => config.into_iter().find(|item| item.task_id == task_id),
+                    Err(error) => {
+                        eprintln!("dashboard task read failed: {error}");
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "tasks unavailable",
+                        );
+                        return;
+                    }
+                };
                 let Some(task) = task else {
                     write_response(&mut stream, "404 Not Found", "unknown task");
                     return;
@@ -934,32 +920,19 @@ fn handle_connection(
                         &task_request.item,
                         task_request.enabled,
                     ) {
-                        Ok(Some(task)) => match reload_task_config(database_path, config_store) {
-                            Ok(()) => {
-                                let _ = wake_sender.send(WorkerCommand::ConfigChanged);
-                                match serde_json::to_string(&task) {
-                                    Ok(body) => write_response_with_type(
-                                        &mut stream,
-                                        "200 OK",
-                                        "application/json; charset=utf-8",
-                                        &body,
-                                    ),
-                                    Err(error) => {
-                                        eprintln!("dashboard task serialization failed: {error}");
-                                        write_response(
-                                            &mut stream,
-                                            "500 Internal Server Error",
-                                            "task unavailable",
-                                        );
-                                    }
-                                }
-                            }
+                        Ok(Some(task)) => match serde_json::to_string(&task) {
+                            Ok(body) => write_response_with_type(
+                                &mut stream,
+                                "200 OK",
+                                "application/json; charset=utf-8",
+                                &body,
+                            ),
                             Err(error) => {
-                                eprintln!("dashboard task reload failed: {error}");
+                                eprintln!("dashboard task serialization failed: {error}");
                                 write_response(
                                     &mut stream,
                                     "500 Internal Server Error",
-                                    "task reload failed",
+                                    "task unavailable",
                                 );
                             }
                         },
@@ -981,20 +954,7 @@ fn handle_connection(
                     return;
                 };
                 match tasks::delete_task(database_path, task_id) {
-                    Ok(true) => match reload_task_config(database_path, config_store) {
-                        Ok(()) => {
-                            let _ = wake_sender.send(WorkerCommand::ConfigChanged);
-                            write_response(&mut stream, "204 No Content", "")
-                        }
-                        Err(error) => {
-                            eprintln!("dashboard task reload failed: {error}");
-                            write_response(
-                                &mut stream,
-                                "500 Internal Server Error",
-                                "task reload failed",
-                            );
-                        }
-                    },
+                    Ok(true) => write_response(&mut stream, "204 No Content", ""),
                     Ok(false) => write_response(&mut stream, "404 Not Found", "unknown task"),
                     Err(error) => {
                         eprintln!("dashboard task delete failed: {error}");
@@ -1016,10 +976,18 @@ fn handle_connection(
         write_response(&mut stream, "405 Method Not Allowed", "POST required");
         return;
     }
-    let config = config_store
-        .read()
-        .expect("webhook config lock poisoned")
-        .clone();
+    let config = match load_webhook_config(database_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("webhook task read failed: {error}");
+            write_response(
+                &mut stream,
+                "500 Internal Server Error",
+                "tasks unavailable",
+            );
+            return;
+        }
+    };
     let event = match parse_event(&request.headers, &request.body) {
         Ok(event) => event,
         Err(error) => {
@@ -1834,19 +1802,20 @@ mod tests {
     use crate::{DivergencePolicy, Item, SyncMode, TagPolicy};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use hmac::{Hmac, Mac};
+    use rusqlite::Connection;
     use sha2::Sha256;
     use std::{
         collections::BTreeMap,
         fs,
-        io::Write,
+        io::{Read, Write},
         net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
         path::Path,
         sync::{
             atomic::{AtomicBool, Ordering},
-            mpsc, Arc, RwLock,
+            mpsc, Arc,
         },
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     type HmacSha256 = Hmac<Sha256>;
@@ -1869,6 +1838,91 @@ mod tests {
         let request = super::read_request(&mut server).unwrap();
         writer.join().unwrap();
         assert_eq!(request.path, "/api/auth/status");
+    }
+
+    #[test]
+    fn dashboard_status_picks_up_external_task_inserts() {
+        let root = std::env::temp_dir().join(format!(
+            "repo-sync-reload-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("tasks.sqlite3");
+        let item = |workspace: &str| Item {
+            source: format!("https://example.com/{workspace}.git"),
+            target: vec!["https://example.com/target.git".into()],
+            workspace: format!("./{workspace}"),
+            mode: SyncMode::Branch,
+            crontab: None,
+            branches: Vec::new(),
+            include_refs: Vec::new(),
+            exclude_refs: Vec::new(),
+            timeout_secs: 300,
+            dry_run: true,
+            allow_destructive: false,
+            sync_lfs: false,
+            divergence: DivergencePolicy::Fail,
+            tag_policy: TagPolicy::Preserve,
+            prune_branches: false,
+            prune_tags: false,
+            atomic: true,
+            max_retries: 3,
+            retry_backoff_secs: 5,
+            failure_cooldown_secs: 60,
+            webhook_secret_envs: Vec::new(),
+            webhook_max_pending_events: 10_000,
+            webhook_event_lease_secs: 900,
+        };
+        let initial = item("initial");
+        let external = item("external");
+        crate::tasks::create_task(&database, &initial, false).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        let external_json = serde_json::to_string(&external).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (enabled, source, workspace, config_json, created_ms, updated_ms)
+                 VALUES (0, ?1, ?2, ?3, 2, 2)",
+                rusqlite::params![
+                    external.source,
+                    external.workspace,
+                    external_json
+                ],
+            )
+            .unwrap();
+
+        let session =
+            crate::tasks::setup_admin(&database, "diag-user", "diagnostic-password").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+                    session_cookie(&session.token, 60, false)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let (wake_sender, _wake_receiver) = mpsc::channel();
+        super::handle_connection(
+            server,
+            peer,
+            &database,
+            &wake_sender,
+            &LoginLimiter::default(),
+        );
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(snapshot["items"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2077,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_recovers_pending_events_and_retries_failures() {
+    fn worker_reads_tasks_inserted_after_start() {
         let root = std::env::temp_dir().join(format!(
             "repo-sync-worker-test-{}-{}",
             std::process::id(),
@@ -2118,36 +2172,56 @@ mod tests {
         };
         let existing_item = item(&existing_workspace);
         let missing_item = item(&missing_workspace);
-        for value in [&existing_item, &missing_item] {
-            let mut db =
-                super::state::StateDb::open(Path::new(&value.workspace), &value.source).unwrap();
-            assert!(matches!(
-                db.enqueue_manual_event(&value.source, super::state::now_ms(), 10)
-                    .unwrap(),
-                super::state::WebhookEnqueue::Enqueued
-            ));
-        }
+        let database = root.join("tasks.sqlite3");
+        crate::tasks::create_task(&database, &existing_item, true).unwrap();
+        let mut db =
+            super::state::StateDb::open(Path::new(&existing_item.workspace), &existing_item.source)
+                .unwrap();
+        assert!(matches!(
+            db.enqueue_manual_event(&existing_item.source, super::state::now_ms(), 10)
+                .unwrap(),
+            super::state::WebhookEnqueue::Enqueued
+        ));
 
-        let config = Arc::new(RwLock::new(vec![
-            super::WebhookItem {
-                task_id: 1,
-                enabled: true,
-                item: existing_item.clone(),
-                secrets: Vec::new(),
-            },
-            super::WebhookItem {
-                task_id: 2,
-                enabled: true,
-                item: missing_item.clone(),
-                secrets: Vec::new(),
-            },
-        ]));
         let (wake_sender, wake_receiver) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_database = database.clone();
         let worker = thread::spawn(move || {
-            super::worker_loop(config, wake_receiver, wake_sender, worker_shutdown)
+            super::worker_loop(worker_database, wake_receiver, wake_sender, worker_shutdown)
         });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let events = super::state::webhook_events(
+                Path::new(&existing_item.workspace),
+                &existing_item.source,
+                10,
+            )
+            .unwrap();
+            if events.first().is_some_and(|event| event.attempts >= 1) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let connection = Connection::open(&database).unwrap();
+        let missing_json = serde_json::to_string(&missing_item).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (enabled, source, workspace, config_json, created_ms, updated_ms)
+                 VALUES (1, ?1, ?2, ?3, 2, 2)",
+                rusqlite::params![missing_item.source, missing_item.workspace, missing_json],
+            )
+            .unwrap();
+        let mut db =
+            super::state::StateDb::open(Path::new(&missing_item.workspace), &missing_item.source)
+                .unwrap();
+        assert!(matches!(
+            db.enqueue_manual_event(&missing_item.source, super::state::now_ms(), 10)
+                .unwrap(),
+            super::state::WebhookEnqueue::Enqueued
+        ));
 
         thread::sleep(Duration::from_millis(2_500));
         shutdown.store(true, Ordering::Relaxed);
@@ -2159,7 +2233,7 @@ mod tests {
             10,
         )
         .unwrap();
-        assert!(existing_events[0].attempts >= 2);
+        assert!(existing_events[0].attempts >= 1);
         let missing_events = super::state::webhook_events(
             Path::new(&missing_item.workspace),
             &missing_item.source,

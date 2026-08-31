@@ -15,7 +15,6 @@ sha2 = "0.10.9"
 job_scheduler_ng = "2.0.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-signal-hook = "0.3.18"
 uuid = { version = "1.2.1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]

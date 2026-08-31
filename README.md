@@ -192,7 +192,7 @@ repo-sync --database /var/lib/repo-sync/repo-sync.sqlite3 --serve 127.0.0.1:8080
 | `GET /readyz` | 就绪检查 |
 | `POST /webhook` | GitHub/GitLab Webhook；POST 路径可使用反向代理统一规划 |
 
-listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在已有 TLS 反向代理后面。配置更新后发送 `SIGHUP` 可重新加载任务和轮换 secret，无需停止进程。
+listener 自身不提供 TLS。对外提供 Webhook 或管理页面时，放在已有 TLS 反向代理后面。任务配置由 SQLite 作为唯一数据源，管理页面和后台 worker 会直接读取最新配置，无需重启进程。
 
 ## 状态与维护
 
@@ -237,7 +237,7 @@ sudo systemctl enable --now repo-sync
 sudo journalctl -u repo-sync -f
 ```
 
-服务示例使用 `/var/lib/repo-sync` 保存任务数据库和 workspace，使用 `/etc/repo-sync/webhook.env` 保存 secret。修改任务数据库后执行 `sudo systemctl reload repo-sync`。
+服务示例使用 `/var/lib/repo-sync` 保存任务数据库和 workspace，使用 `/etc/repo-sync/webhook.env` 保存 secret。无论是否打开管理页面，后台 worker 和 Webhook 都会直接读取任务数据库中的最新配置；外部 SQL 插入或修改无需重启进程即可生效。
 
 每日任务数据库备份还可以使用 [repo-sync-backup.sh.example](repo-sync-backup.sh.example)、[repo-sync-backup.service.example](repo-sync-backup.service.example) 和 [repo-sync-backup.timer.example](repo-sync-backup.timer.example)。备份模板不会自动删除旧备份。
 
