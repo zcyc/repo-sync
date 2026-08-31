@@ -6,6 +6,16 @@
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#f2eee8">
   <title>repo-sync</title>
+  <script>
+    try {
+      const savedTheme = localStorage.getItem('repo-sync-theme');
+      document.documentElement.dataset.theme = savedTheme === 'light' || savedTheme === 'dark'
+        ? savedTheme
+        : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    } catch {
+      document.documentElement.dataset.theme = 'light';
+    }
+  </script>
   <style>
     :root {
       color-scheme: light;
@@ -85,6 +95,8 @@
     input:focus, textarea:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(180, 95, 66, .14); outline: 0; }
     input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: var(--primary); }
     input[type="number"] { width: 8rem; }
+    #task-form input[type="number"] { width: 100%; }
+    #language-select { width: auto; min-width: 6.5rem; }
     input#username, input#password, input#password-confirm, input#task-filter { min-width: 16rem; width: auto; }
     textarea { min-height: 5rem; resize: vertical; }
     button { cursor: pointer; color: #fff; background: var(--primary); border-color: var(--primary); box-shadow: 0 5px 12px rgba(180, 95, 66, .16); font-weight: 700; transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease; }
@@ -102,8 +114,17 @@
     .panel-heading, .task-toolbar { display: flex; gap: 1rem; align-items: center; justify-content: space-between; margin-bottom: 1.2rem; }
     .section-caption { margin: .28rem 0 0; color: var(--muted); font-size: .8rem; }
     .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-solid); -webkit-overflow-scrolling: touch; }
-    table { border-collapse: collapse; width: 100%; min-width: 1120px; }
-    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: .85rem .65rem; vertical-align: top; }
+    table { border-collapse: collapse; width: 100%; min-width: 1180px; table-layout: fixed; }
+    col.task-id { width: 6%; }
+    col.workspace { width: 14%; }
+    col.source { width: 18%; }
+    col.mode { width: 10%; }
+    col.recent-run { width: 11%; }
+    col.target { width: 5%; }
+    col.queue { width: 12%; }
+    col.updated { width: 6%; }
+    col.task-actions { width: 18%; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: .9rem .7rem; vertical-align: top; overflow-wrap: anywhere; }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover { background: var(--surface-soft); }
     th { color: var(--muted); background: var(--surface-soft); font-size: .68rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
@@ -112,8 +133,15 @@
     code, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     td, td code { font-size: .8rem; line-height: 1.55; }
     td strong { font-size: .84rem; }
-    td.actions { min-width: 11.5rem; align-items: stretch; }
-    td.actions button { padding: .48rem .58rem; font-size: .72rem; }
+    td.task-id { white-space: nowrap; }
+    td.task-id .pill { display: flex; width: max-content; margin-top: .4rem; }
+    .cell-detail { display: block; margin-top: .2rem; color: var(--muted); font-size: .72rem; line-height: 1.4; }
+    .repo-url, .workspace-path { display: block; overflow-wrap: anywhere; }
+    .queue-count { font-weight: 700; }
+    td.actions { min-width: 15rem; padding: .75rem; }
+    .action-list { display: flex; gap: .45rem; flex-wrap: wrap; }
+    .action-list button { flex: 1 1 0; min-width: 0; min-height: 2.25rem; padding: .45rem .5rem; font-size: .72rem; }
+    .action-list button[data-action="run"] { flex-basis: 100%; }
     .pill { display: inline-flex; align-items: center; gap: .25rem; border-radius: 999px; padding: .22rem .58rem; color: var(--primary-strong); background: var(--primary-soft); font-size: .72rem; font-weight: 800; }
     .pill::before { content: ""; width: .35rem; height: .35rem; border-radius: 50%; background: currentColor; }
     .pill.off { color: var(--muted); background: #eeeae4; }
@@ -125,6 +153,7 @@
     details { margin-top: 1.25rem; border-top: 1px solid var(--line); padding-top: .9rem; }
     summary { cursor: pointer; color: var(--text); font-size: .8rem; font-weight: 800; list-style-position: inside; }
     details[open] summary { margin-bottom: 1.1rem; }
+    #task-form > .actions { margin-top: 1.5rem; }
     .auth-card { max-width: 54rem; margin-inline: auto; }
     .auth-card .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .auth-card .actions { justify-content: end; }
@@ -151,14 +180,31 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
     }
-    @media (prefers-color-scheme: dark) {
-      :root { color-scheme: dark; color: #f1ece5; background: #191715; --bg: #191715; --surface: #24211e; --surface-solid: #24211e; --surface-soft: #2c2824; --line: #413b35; --line-strong: #5a5047; --text: #f1ece5; --muted: #b8aca0; --primary: #d47c5b; --primary-strong: #e08b69; --primary-soft: #493027; --teal: #91b29a; --danger: #e08378; --shadow: 0 18px 44px rgba(0, 0, 0, .24); --shadow-sm: 0 7px 18px rgba(0, 0, 0, .2); }
-      input::placeholder, textarea::placeholder { color: #887c71; }
-      button.secondary { background: var(--surface-solid); }
-      button.danger, .error { background: #3a2522 !important; border-color: #74413a !important; }
-      .pill.off { background: #413b35; color: #b8aca0; }
-      #message:not(:empty) { background: var(--surface-solid); }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      color: #f1ece5;
+      background: #191715;
+      --bg: #191715;
+      --surface: #24211e;
+      --surface-solid: #24211e;
+      --surface-soft: #2c2824;
+      --line: #413b35;
+      --line-strong: #5a5047;
+      --text: #f1ece5;
+      --muted: #b8aca0;
+      --primary: #d47c5b;
+      --primary-strong: #e08b69;
+      --primary-soft: #493027;
+      --teal: #91b29a;
+      --danger: #e08378;
+      --shadow: 0 18px 44px rgba(0, 0, 0, .24);
+      --shadow-sm: 0 7px 18px rgba(0, 0, 0, .2);
     }
+    html[data-theme="dark"] input::placeholder, html[data-theme="dark"] textarea::placeholder { color: #887c71; }
+    html[data-theme="dark"] button.secondary { background: var(--surface-solid); }
+    html[data-theme="dark"] button.danger, html[data-theme="dark"] .error { background: #3a2522 !important; border-color: #74413a !important; }
+    html[data-theme="dark"] .pill.off { background: #413b35; color: #b8aca0; }
+    html[data-theme="dark"] #message:not(:empty) { background: var(--surface-solid); }
   </style>
 </head>
 <body>
@@ -166,27 +212,34 @@
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">↔</div>
       <div>
-        <span class="eyebrow">同步控制台</span>
+        <span class="eyebrow" data-i18n="consoleEyebrow">同步控制台</span>
         <h1>repo-sync</h1>
-        <p class="subtitle">SQLite 任务、同步状态和 Webhook 队列</p>
+        <p class="subtitle" data-i18n="appSubtitle">SQLite 任务、同步状态和 Webhook 队列</p>
       </div>
     </div>
     <div class="header-tools">
-      <div class="header-meta"><span class="status-dot"></span>服务在线 · 每 5 秒自动更新</div>
+      <div class="header-meta"><span class="status-dot"></span><span data-i18n="serviceStatus">服务在线 · 每 5 秒自动更新</span></div>
       <div class="controls">
-        <label for="task-filter">筛选任务
-          <input id="task-filter" type="search" placeholder="ID、源仓库或 Workspace" autocomplete="off">
+        <label for="task-filter"><span data-i18n="filterTask">筛选任务</span>
+          <input id="task-filter" type="search" placeholder="ID、源仓库或 Workspace" data-i18n-placeholder="filterPlaceholder" autocomplete="off">
         </label>
-        <label for="status-filter">状态
+        <label for="status-filter"><span data-i18n="status">状态</span>
           <select id="status-filter">
-            <option value="all">全部</option>
-            <option value="enabled">启用</option>
-            <option value="disabled">停用</option>
-            <option value="failed">失败</option>
-            <option value="queued">有待处理事件</option>
+            <option value="all" data-i18n="all">全部</option>
+            <option value="enabled" data-i18n="enabled">启用</option>
+            <option value="disabled" data-i18n="disabled">停用</option>
+            <option value="failed" data-i18n="failed">失败</option>
+            <option value="queued" data-i18n="queued">有待处理事件</option>
           </select>
         </label>
-        <button id="logout" class="secondary" type="button" hidden>退出登录</button>
+        <label for="language-select"><span data-i18n="language">语言</span>
+          <select id="language-select">
+            <option value="zh" data-i18n="chinese">中文</option>
+            <option value="en" data-i18n="english">English</option>
+          </select>
+        </label>
+        <button id="theme-toggle" class="secondary" type="button" aria-pressed="false"></button>
+        <button id="logout" class="secondary" type="button" hidden data-i18n="logout">退出登录</button>
       </div>
     </div>
   </header>
@@ -194,123 +247,124 @@
   <p id="message" role="status" aria-live="polite"></p>
 
   <section id="auth-panel" class="auth-card" hidden>
-    <div class="panel-heading"><div><span class="eyebrow">安全登录</span><h2 id="auth-title">登录</h2><p class="section-caption">使用管理员账号进入同步控制台</p></div></div>
+    <div class="panel-heading"><div><span class="eyebrow" data-i18n="authEyebrow">安全登录</span><h2 id="auth-title">登录</h2><p class="section-caption" data-i18n="authCaption">使用管理员账号进入同步控制台</p></div></div>
     <form id="auth-form" class="form-grid">
-      <label for="username">账号
+      <label for="username"><span data-i18n="account">账号</span>
         <input id="username" name="username" required maxlength="64" autocomplete="username">
       </label>
-      <label for="password">密码
+      <label for="password"><span data-i18n="password">密码</span>
         <input id="password" name="password" type="password" required minlength="12" maxlength="256" autocomplete="current-password">
       </label>
-      <label id="password-confirm-field" for="password-confirm">确认密码
+      <label id="password-confirm-field" for="password-confirm"><span data-i18n="confirmPassword">确认密码</span>
         <input id="password-confirm" name="password-confirm" type="password" minlength="12" maxlength="256" autocomplete="new-password">
       </label>
-      <p class="actions full"><button id="auth-submit" type="submit">登录</button></p>
+      <p class="actions full"><button id="auth-submit" type="submit" data-i18n="signIn">登录</button></p>
     </form>
   </section>
 
   <main id="app" hidden>
   <section>
-    <div class="panel-heading"><div><span class="eyebrow">账号设置</span><h2>账号安全</h2><p class="section-caption">定期更新凭据，保护任务配置和运行权限</p></div></div>
+    <div class="panel-heading"><div><span class="eyebrow" data-i18n="settingsEyebrow">账号设置</span><h2 data-i18n="accountSecurity">账号安全</h2><p class="section-caption" data-i18n="passwordCaption">定期更新凭据，保护任务配置和运行权限</p></div></div>
     <form id="password-form" class="form-grid">
-      <label for="current-password">当前密码
+      <label for="current-password"><span data-i18n="currentPassword">当前密码</span>
         <input id="current-password" name="current-password" type="password" required minlength="12" maxlength="256" autocomplete="current-password">
       </label>
-      <label for="new-password">新密码
+      <label for="new-password"><span data-i18n="newPassword">新密码</span>
         <input id="new-password" name="new-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
       </label>
-      <label for="new-password-confirm">确认新密码
+      <label for="new-password-confirm"><span data-i18n="confirmNewPassword">确认新密码</span>
         <input id="new-password-confirm" name="new-password-confirm" type="password" required minlength="12" maxlength="256" autocomplete="new-password">
       </label>
-      <p class="actions full"><button type="submit">修改密码</button></p>
+      <p class="actions full"><button type="submit" data-i18n="changePassword">修改密码</button></p>
     </form>
   </section>
 
   <section>
     <div class="task-toolbar">
-      <div><span class="eyebrow">任务列表</span><h2>同步任务</h2><p class="section-caption">管理仓库镜像、定时运行和 Webhook 队列</p></div>
-      <div class="actions"><button id="new-task" type="button">新建任务</button></div>
+      <div><span class="eyebrow" data-i18n="taskListEyebrow">任务列表</span><h2 data-i18n="syncTasks">同步任务</h2><p class="section-caption" data-i18n="taskCaption">管理仓库镜像、定时运行和 Webhook 队列</p></div>
+      <div class="actions"><button id="new-task" type="button" data-i18n="newTask">新建任务</button></div>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID / 状态</th><th>Workspace</th><th>源仓库</th><th>模式 / 调度</th><th>最近运行</th><th>目标</th><th>Webhook 队列</th><th>最后配置</th><th>操作</th></tr></thead>
-        <tbody id="tasks"><tr><td colspan="9" class="muted">登录后加载任务</td></tr></tbody>
+        <colgroup><col class="task-id"><col class="workspace"><col class="source"><col class="mode"><col class="recent-run"><col class="target"><col class="queue"><col class="updated"><col class="task-actions"></colgroup>
+        <thead><tr><th data-i18n="idStatus">ID / 状态</th><th>Workspace</th><th data-i18n="sourceRepo">源仓库</th><th data-i18n="modeSchedule">模式 / 调度</th><th data-i18n="recentRun">最近运行</th><th data-i18n="target">目标</th><th data-i18n="webhookQueue">Webhook 队列</th><th data-i18n="lastConfig">最后配置</th><th data-i18n="actions">操作</th></tr></thead>
+        <tbody id="tasks"><tr><td colspan="9" class="muted" data-i18n="loginToLoad">登录后加载任务</td></tr></tbody>
       </table>
     </div>
   </section>
 
   <section>
-    <div class="panel-heading"><div><span class="eyebrow">任务配置</span><h2 id="editor-title">新建同步任务</h2><p class="section-caption">保存后配置会立即生效</p></div></div>
+    <div class="panel-heading"><div><span class="eyebrow" data-i18n="taskConfigEyebrow">任务配置</span><h2 id="editor-title">新建同步任务</h2><p class="section-caption" data-i18n="saveCaption">保存后配置会立即生效</p></div></div>
     <form id="task-form">
       <input id="task-id" type="hidden">
       <div class="form-grid">
-        <label class="wide">源仓库 URL 或路径
-          <input id="source" required placeholder="https://example.com/org/repo.git">
+        <label class="wide"><span data-i18n="sourceUrl">源仓库 URL 或路径</span>
+          <input id="source" required placeholder="https://example.com/org/repo.git" data-i18n-placeholder="sourcePlaceholder">
         </label>
-        <label>Workspace
-          <input id="workspace" required placeholder="./repo-workspace">
+        <label><span>Workspace</span>
+          <input id="workspace" required placeholder="./repo-workspace" data-i18n-placeholder="workspacePlaceholder">
         </label>
-        <label class="wide">目标仓库（每行一个）
-          <textarea id="target" required placeholder="https://example.com/org/mirror.git"></textarea>
+        <label class="wide"><span data-i18n="targetRepo">目标仓库（每行一个）</span>
+          <textarea id="target" required placeholder="https://example.com/org/mirror.git" data-i18n-placeholder="targetPlaceholder"></textarea>
         </label>
-        <label>模式
+        <label><span data-i18n="mode">模式</span>
           <select id="mode"><option value="branch">branch</option><option value="mirror">mirror</option></select>
         </label>
-        <label>Crontab（可选）
-          <input id="crontab" placeholder="0/10 * * * * ? *">
+        <label><span data-i18n="crontab">Crontab（可选）</span>
+          <input id="crontab" placeholder="0/10 * * * * ? *" data-i18n-placeholder="crontabPlaceholder">
         </label>
-        <label>分支（每行一个，空=全部）
-          <textarea id="branches" placeholder="main&#10;release/*"></textarea>
+        <label><span data-i18n="branches">分支（每行一个，空=全部）</span>
+          <textarea id="branches" placeholder="main&#10;release/*" data-i18n-placeholder="branchesPlaceholder"></textarea>
         </label>
-        <label>包含 refs（每行一个）
-          <textarea id="include-refs" placeholder="refs/heads/*"></textarea>
+        <label><span data-i18n="includeRefs">包含 refs（每行一个）</span>
+          <textarea id="include-refs" placeholder="refs/heads/*" data-i18n-placeholder="includeRefsPlaceholder"></textarea>
         </label>
-        <label>排除 refs（每行一个）
-          <textarea id="exclude-refs" placeholder="refs/heads/tmp/*"></textarea>
+        <label><span data-i18n="excludeRefs">排除 refs（每行一个）</span>
+          <textarea id="exclude-refs" placeholder="refs/heads/tmp/*" data-i18n-placeholder="excludeRefsPlaceholder"></textarea>
         </label>
-        <label>超时（秒）
+        <label><span data-i18n="timeout">超时（秒）</span>
           <input id="timeout-secs" type="number" min="1" value="300" required>
         </label>
       </div>
       <details>
-        <summary>高级选项</summary>
+        <summary data-i18n="advancedOptions">高级选项</summary>
         <div class="form-grid">
           <div class="full checks">
-            <label><input id="enabled" type="checkbox" checked>启用任务</label>
-            <label><input id="dry-run" type="checkbox">Dry run</label>
-            <label><input id="allow-destructive" type="checkbox">允许破坏性操作</label>
-            <label><input id="sync-lfs" type="checkbox">同步 Git LFS</label>
-            <label><input id="prune-branches" type="checkbox">清理目标分支</label>
-            <label><input id="prune-tags" type="checkbox">清理目标标签</label>
-            <label><input id="atomic" type="checkbox" checked>Atomic push</label>
+            <label><input id="enabled" type="checkbox" checked><span data-i18n="enableTask">启用任务</span></label>
+            <label><input id="dry-run" type="checkbox"><span data-i18n="dryRun">Dry run</span></label>
+            <label><input id="allow-destructive" type="checkbox"><span data-i18n="allowDestructive">允许破坏性操作</span></label>
+            <label><input id="sync-lfs" type="checkbox"><span data-i18n="syncGitLfs">同步 Git LFS</span></label>
+            <label><input id="prune-branches" type="checkbox"><span data-i18n="pruneBranches">清理目标分支</span></label>
+            <label><input id="prune-tags" type="checkbox"><span data-i18n="pruneTags">清理目标标签</span></label>
+            <label><input id="atomic" type="checkbox" checked><span data-i18n="atomicPush">Atomic push</span></label>
           </div>
-          <label>分支分叉策略
+          <label><span data-i18n="divergencePolicy">分支分叉策略</span>
             <select id="divergence"><option value="fail">fail</option><option value="keep">keep</option><option value="force">force</option></select>
           </label>
-          <label>标签冲突策略
+          <label><span data-i18n="tagPolicy">标签冲突策略</span>
             <select id="tag-policy"><option value="preserve">preserve</option><option value="fail">fail</option><option value="force">force</option></select>
           </label>
-          <label>额外重试次数
+          <label><span data-i18n="maxRetries">额外重试次数</span>
             <input id="max-retries" type="number" min="0" max="10" value="3" required>
           </label>
-          <label>重试初始间隔（秒）
+          <label><span data-i18n="retryBackoff">重试初始间隔（秒）</span>
             <input id="retry-backoff-secs" type="number" min="0" value="5" required>
           </label>
-          <label>失败冷却（秒）
+          <label><span data-i18n="failureCooldown">失败冷却（秒）</span>
             <input id="failure-cooldown-secs" type="number" min="0" value="60" required>
           </label>
-          <label>Webhook secret 环境变量（每行一个）
-            <textarea id="webhook-secret-envs" placeholder="REPO_SYNC_WEBHOOK_SECRET_MAIN"></textarea>
+          <label><span data-i18n="webhookSecretEnv">Webhook secret 环境变量（每行一个）</span>
+            <textarea id="webhook-secret-envs" placeholder="REPO_SYNC_WEBHOOK_SECRET_MAIN" data-i18n-placeholder="webhookSecretPlaceholder"></textarea>
           </label>
-          <label>最大待处理事件数
+          <label><span data-i18n="maxPendingEvents">最大待处理事件数</span>
             <input id="webhook-max-pending-events" type="number" min="1" value="10000" required>
           </label>
-          <label>事件租约（秒）
+          <label><span data-i18n="eventLease">事件租约（秒）</span>
             <input id="webhook-event-lease-secs" type="number" min="1" value="900" required>
           </label>
         </div>
       </details>
-      <p class="actions"><button type="submit">保存任务</button><button id="cancel" class="secondary" type="button">取消编辑</button></p>
+      <p class="actions"><button type="submit" data-i18n="saveTask">保存任务</button><button id="cancel" class="secondary" type="button" data-i18n="cancelEdit">取消编辑</button></p>
     </form>
   </section>
   </main>
@@ -331,8 +385,71 @@
     const editorTitle = document.querySelector('#editor-title');
     const taskFilter = document.querySelector('#task-filter');
     const statusFilter = document.querySelector('#status-filter');
+    const languageSelect = document.querySelector('#language-select');
+    const themeToggle = document.querySelector('#theme-toggle');
+    const themeColor = document.querySelector('meta[name="theme-color"]');
     let taskRecords = [];
     let snapshot = [];
+    let messageState = null;
+
+    const translations = {
+      zh: {
+        consoleEyebrow: '同步控制台', appSubtitle: 'SQLite 任务、同步状态和 Webhook 队列', serviceStatus: '服务在线 · 每 5 秒自动更新',
+        filterTask: '筛选任务', filterPlaceholder: 'ID、源仓库或 Workspace', status: '状态', all: '全部', enabled: '启用', disabled: '停用', failed: '失败', queued: '有待处理事件',
+        language: '语言', chinese: '中文', english: '英文', switchToDark: '深色模式', switchToLight: '浅色模式', logout: '退出登录',
+        authEyebrow: '安全登录', login: '登录', firstSetup: '首次设置管理员账号', setupAndSignIn: '设置并登录', authCaption: '使用管理员账号进入同步控制台', account: '账号', password: '密码', confirmPassword: '确认密码', signIn: '登录',
+        settingsEyebrow: '账号设置', accountSecurity: '账号安全', passwordCaption: '定期更新凭据，保护任务配置和运行权限', currentPassword: '当前密码', newPassword: '新密码', confirmNewPassword: '确认新密码', changePassword: '修改密码',
+        taskListEyebrow: '任务列表', syncTasks: '同步任务', taskCaption: '管理仓库镜像、定时运行和 Webhook 队列', newTask: '新建任务', idStatus: 'ID / 状态', sourceRepo: '源仓库', modeSchedule: '模式 / 调度', recentRun: '最近运行', target: '目标', webhookQueue: 'Webhook 队列', lastConfig: '最后配置', actions: '操作', loginToLoad: '登录后加载任务',
+        taskConfigEyebrow: '任务配置', newSyncTask: '新建同步任务', editTask: '编辑任务', saveCaption: '保存后配置会立即生效', sourceUrl: '源仓库 URL 或路径', sourcePlaceholder: 'https://example.com/org/repo.git', workspacePlaceholder: './repo-workspace', targetRepo: '目标仓库（每行一个）', targetPlaceholder: 'https://example.com/org/mirror.git', mode: '模式', crontab: 'Crontab（可选）', crontabPlaceholder: '0/10 * * * * ? *', branches: '分支（每行一个，空=全部）', branchesPlaceholder: 'main\nrelease/*', includeRefs: '包含 refs（每行一个）', includeRefsPlaceholder: 'refs/heads/*', excludeRefs: '排除 refs（每行一个）', excludeRefsPlaceholder: 'refs/heads/tmp/*', timeout: '超时（秒）',
+        advancedOptions: '高级选项', enableTask: '启用任务', dryRun: '试运行', allowDestructive: '允许破坏性操作', syncGitLfs: '同步 Git LFS', pruneBranches: '清理目标分支', pruneTags: '清理目标标签', atomicPush: '原子推送', divergencePolicy: '分支分叉策略', tagPolicy: '标签冲突策略', maxRetries: '额外重试次数', retryBackoff: '重试初始间隔（秒）', failureCooldown: '失败冷却（秒）', webhookSecretEnv: 'Webhook secret 环境变量（每行一个）', webhookSecretPlaceholder: 'REPO_SYNC_WEBHOOK_SECRET_MAIN', maxPendingEvents: '最大待处理事件数', eventLease: '事件租约（秒）', saveTask: '保存任务', cancelEdit: '取消编辑',
+        statusNone: '无', statusRunning: '运行中', statusQueued: '排队中', statusFailed: '失败', statusSucceeded: '成功', statusCompleted: '已完成', statusCancelled: '已取消', statusDead: '已终止', queueEmpty: '空', oldest: '最老 {seconds}s', targets: '个目标', noSchedule: '无调度',
+        retryEvent: '重试事件', cancelExecution: '取消执行', runNow: '立即同步', edit: '编辑', enable: '启用', disable: '停用', delete: '删除', noMatches: '没有匹配的任务', noTasks: '没有任务，点击“新建任务”开始', loading: '加载中…', lastUpdated: '最后更新：{time}', authStatusInvalid: '认证状态响应无效', authStatusReadFailed: '认证状态读取失败：{error}', sessionExpired: '登录已失效，请重新登录', loadFailed: '加载失败：{error}', saved: '任务已保存并立即生效', saveFailed: '保存失败：{error}', passwordMismatch: '两次新密码不一致', passwordChanged: '密码已修改', passwordChangeFailed: '密码修改失败：{error}', passwordMismatchSetup: '两次密码不一致', loginSuccess: '登录成功', setupFailed: '设置失败：{error}', loginFailed: '登录失败：{error}', queuedTask: '任务 #{id} 已加入执行队列', cancelRequested: '任务 #{id} 已请求取消', eventRetried: '事件 #{eventId} 已重新加入队列', deleteConfirm: '删除任务 #{id}？不会删除 workspace 或运行历史。', actionFailed: '操作失败：{error}', logoutSuccess: '已退出登录', logoutFailed: '退出登录失败：{error}'
+      },
+      en: {
+        consoleEyebrow: 'Sync console', appSubtitle: 'SQLite tasks, sync status, and Webhook queue', serviceStatus: 'Service online · refreshes every 5 sec',
+        filterTask: 'Filter tasks', filterPlaceholder: 'ID, source repository, or workspace', status: 'Status', all: 'All', enabled: 'Enabled', disabled: 'Disabled', failed: 'Failed', queued: 'Has pending events',
+        language: 'Language', chinese: 'Chinese', english: 'English', switchToDark: 'Dark mode', switchToLight: 'Light mode', logout: 'Log out',
+        authEyebrow: 'Secure login', login: 'Log in', firstSetup: 'Set up administrator account', setupAndSignIn: 'Set up and sign in', authCaption: 'Use an administrator account to enter the sync console', account: 'Account', password: 'Password', confirmPassword: 'Confirm password', signIn: 'Sign in',
+        settingsEyebrow: 'Account settings', accountSecurity: 'Account security', passwordCaption: 'Update credentials regularly to protect task configuration and run permissions', currentPassword: 'Current password', newPassword: 'New password', confirmNewPassword: 'Confirm new password', changePassword: 'Change password',
+        taskListEyebrow: 'Task list', syncTasks: 'Sync tasks', taskCaption: 'Manage repository mirrors, scheduled runs, and the Webhook queue', newTask: 'New task', idStatus: 'ID / Status', sourceRepo: 'Source repository', modeSchedule: 'Mode / Schedule', recentRun: 'Recent run', target: 'Targets', webhookQueue: 'Webhook queue', lastConfig: 'Last configured', actions: 'Actions', loginToLoad: 'Log in to load tasks',
+        taskConfigEyebrow: 'Task configuration', newSyncTask: 'New sync task', editTask: 'Edit task', saveCaption: 'Changes take effect immediately after saving', sourceUrl: 'Source repository URL or path', sourcePlaceholder: 'https://example.com/org/repo.git', workspacePlaceholder: './repo-workspace', targetRepo: 'Target repositories (one per line)', targetPlaceholder: 'https://example.com/org/mirror.git', mode: 'Mode', crontab: 'Crontab (optional)', crontabPlaceholder: '0/10 * * * * ? *', branches: 'Branches (one per line, empty = all)', branchesPlaceholder: 'main\nrelease/*', includeRefs: 'Included refs (one per line)', includeRefsPlaceholder: 'refs/heads/*', excludeRefs: 'Excluded refs (one per line)', excludeRefsPlaceholder: 'refs/heads/tmp/*', timeout: 'Timeout (seconds)',
+        advancedOptions: 'Advanced options', enableTask: 'Enable task', dryRun: 'Dry run', allowDestructive: 'Allow destructive operations', syncGitLfs: 'Sync Git LFS', pruneBranches: 'Prune target branches', pruneTags: 'Prune target tags', atomicPush: 'Atomic push', divergencePolicy: 'Branch divergence policy', tagPolicy: 'Tag conflict policy', maxRetries: 'Extra retries', retryBackoff: 'Initial retry backoff (seconds)', failureCooldown: 'Failure cooldown (seconds)', webhookSecretEnv: 'Webhook secret environment variables (one per line)', webhookSecretPlaceholder: 'REPO_SYNC_WEBHOOK_SECRET_MAIN', maxPendingEvents: 'Maximum pending events', eventLease: 'Event lease (seconds)', saveTask: 'Save task', cancelEdit: 'Cancel edit',
+        statusNone: 'None', statusRunning: 'Running', statusQueued: 'Queued', statusFailed: 'Failed', statusSucceeded: 'Succeeded', statusCompleted: 'Completed', statusCancelled: 'Cancelled', statusDead: 'Dead', queueEmpty: 'Empty', oldest: 'Oldest {seconds}s', targets: 'targets', noSchedule: 'No schedule',
+        retryEvent: 'Retry event', cancelExecution: 'Cancel run', runNow: 'Sync now', edit: 'Edit', enable: 'Enable', disable: 'Disable', delete: 'Delete', noMatches: 'No matching tasks', noTasks: 'No tasks yet. Click “New task” to get started', loading: 'Loading…', lastUpdated: 'Last updated: {time}', authStatusInvalid: 'Invalid authentication status response', authStatusReadFailed: 'Failed to read authentication status: {error}', sessionExpired: 'Your session has expired. Please sign in again', loadFailed: 'Load failed: {error}', saved: 'Task saved and active immediately', saveFailed: 'Save failed: {error}', passwordMismatch: 'The new passwords do not match', passwordChanged: 'Password changed', passwordChangeFailed: 'Password change failed: {error}', passwordMismatchSetup: 'The passwords do not match', loginSuccess: 'Signed in successfully', setupFailed: 'Setup failed: {error}', loginFailed: 'Sign-in failed: {error}', queuedTask: 'Task #{id} added to the run queue', cancelRequested: 'Cancellation requested for task #{id}', eventRetried: 'Event #{eventId} added back to the queue', deleteConfirm: 'Delete task #{id}? The workspace and run history will not be deleted.', actionFailed: 'Action failed: {error}', logoutSuccess: 'Signed out', logoutFailed: 'Sign-out failed: {error}'
+      }
+    };
+
+    const readSetting = key => { try { return localStorage.getItem(key); } catch { return null; } };
+    const writeSetting = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+    const savedLocale = readSetting('repo-sync-language');
+    let locale = savedLocale === 'en' ? 'en' : 'zh';
+    let theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+    const t = (key, values = {}) => Object.entries(values).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), translations[locale][key] ?? translations.zh[key] ?? key);
+    const setMessage = (key, values = {}, className = 'muted') => { messageState = { key, values, className }; message.textContent = t(key, values); message.className = className; };
+    const statusText = status => ({ none: t('statusNone'), running: t('statusRunning'), queued: t('statusQueued'), failed: t('statusFailed'), success: t('statusSucceeded'), succeeded: t('statusSucceeded'), completed: t('statusCompleted'), cancelled: t('statusCancelled'), canceled: t('statusCancelled'), dead: t('statusDead') }[status] || status);
+    const queueText = status => ({ queued: t('statusQueued'), running: t('statusRunning'), failed: t('statusFailed'), success: t('statusSucceeded'), succeeded: t('statusSucceeded'), completed: t('statusCompleted'), dead: t('statusDead') }[status] || status);
+
+    function updateThemeControl() {
+      const label = theme === 'dark' ? t('switchToLight') : t('switchToDark');
+      themeToggle.textContent = label;
+      themeToggle.setAttribute('aria-label', label);
+      themeToggle.setAttribute('aria-pressed', String(theme === 'dark'));
+      themeColor.content = theme === 'dark' ? '#191715' : '#f2eee8';
+    }
+
+    function applyLocale() {
+      document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
+      languageSelect.value = locale;
+      document.querySelectorAll('[data-i18n]').forEach(element => { element.textContent = t(element.dataset.i18n); });
+      document.querySelectorAll('[data-i18n-placeholder]').forEach(element => { element.placeholder = t(element.dataset.i18nPlaceholder); });
+      const authInitialized = passwordConfirmField.hidden;
+      authTitle.textContent = authInitialized ? t('login') : t('firstSetup');
+      authSubmit.textContent = authInitialized ? t('signIn') : t('setupAndSignIn');
+      const taskId = document.querySelector('#task-id').value;
+      editorTitle.textContent = taskId ? `${t('editTask')} #${taskId}` : t('newSyncTask');
+      if (messageState) { message.textContent = t(messageState.key, messageState.values); message.className = messageState.className; }
+      updateThemeControl();
+    }
 
     const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const request = async (url, options = {}) => {
@@ -344,12 +461,12 @@
     const setLines = (id, values) => { document.querySelector(`#${id}`).value = (values || []).join('\n'); };
     const number = id => Number(document.querySelector(`#${id}`).value);
     const checked = id => document.querySelector(`#${id}`).checked;
-    const formatTime = value => value ? new Date(value).toLocaleString() : '—';
+    const formatTime = value => value ? new Date(value).toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US') : '—';
 
     function showAuth(initialized) {
       authPanel.hidden = false; app.hidden = true; logout.hidden = true;
-      authTitle.textContent = initialized ? '登录' : '首次设置管理员账号';
-      authSubmit.textContent = initialized ? '登录' : '设置并登录';
+      authTitle.textContent = initialized ? t('login') : t('firstSetup');
+      authSubmit.textContent = initialized ? t('signIn') : t('setupAndSignIn');
       passwordConfirmField.hidden = initialized;
       document.querySelector('#password').autocomplete = initialized ? 'current-password' : 'new-password';
     }
@@ -359,10 +476,10 @@
     async function initAuth() {
       try {
         const status = await request('/api/auth/status');
-        if (typeof status.initialized !== 'boolean') throw new Error('认证状态响应无效');
+        if (typeof status.initialized !== 'boolean') throw new Error(t('authStatusInvalid'));
         showAuth(status.initialized);
         if (status.initialized) await load();
-      } catch (error) { message.textContent = `认证状态读取失败：${error.message}`; message.className = 'error'; }
+      } catch (error) { setMessage('authStatusReadFailed', { error: error.message }, 'error'); }
     }
 
     const emptyItem = () => ({
@@ -375,17 +492,17 @@
     });
 
     async function load() {
-      message.textContent = '加载中…'; message.className = 'muted';
+      setMessage('loading');
       try {
         const [nextSnapshot, nextTasks] = await Promise.all([request('/api/status'), request('/api/tasks')]);
         snapshot = nextSnapshot.items || [];
         taskRecords = nextTasks || [];
         render();
-        message.textContent = `最后更新：${new Date().toLocaleString()}`;
+        setMessage('lastUpdated', { time: new Date().toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US') });
         showApp();
       } catch (error) {
-        if (error.message.startsWith('401')) { showAuth(true); message.textContent = '登录已失效，请重新登录'; message.className = 'error'; }
-        else { message.textContent = `加载失败：${error.message}`; message.className = 'error'; }
+        if (error.message.startsWith('401')) { showAuth(true); setMessage('sessionExpired', {}, 'error'); }
+        else { setMessage('loadFailed', { error: error.message }, 'error'); }
       }
     }
 
@@ -407,18 +524,18 @@
       tasks.innerHTML = visible.length ? visible.map(item => {
         const config = item.config;
         const run = item.status.latest_run;
-        const queue = Object.entries(item.queue.counts || {}).map(([key, value]) => `${escapeHtml(key)}=${value}`).join(' · ') || '空';
+        const queue = Object.entries(item.queue.counts || {}).map(([key, value]) => `${escapeHtml(queueText(key))}=${value}`).join(' · ') || t('queueEmpty');
         const event = item.events[0];
-        const state = item.enabled ? '<span class="pill">启用</span>' : '<span class="pill off">停用</span>';
+        const state = item.enabled ? `<span class="pill">${t('enabled')}</span>` : `<span class="pill off">${t('disabled')}</span>`;
         const record = taskRecords.find(value => value.id === item.id);
         const updated = record ? formatTime(record.updated_ms) : '—';
-        const recentRuns = (item.status.recent_runs || []).map(history => `<li><strong>${escapeHtml(history.status)}</strong> · ${escapeHtml(formatTime(history.started_ms))}${history.finished_ms ? ` → ${escapeHtml(formatTime(history.finished_ms))}` : ''}${history.error ? `<br><span class="muted">${escapeHtml(history.error)}</span>` : ''}</li>`).join('');
-        const runDetails = recentRuns ? `<details><summary>${escapeHtml(run?.status || 'none')} · ${escapeHtml(formatTime(run?.started_ms))}</summary><ol>${recentRuns}</ol></details>` : escapeHtml(run?.status || 'none');
-        const retry = event && ['failed', 'dead'].includes(event.status) ? `<button data-action="retry" data-id="${item.id}" data-event-id="${event.event_id}" type="button" class="secondary">重试事件</button>` : '';
+        const recentRuns = (item.status.recent_runs || []).map(history => `<li><strong>${escapeHtml(statusText(history.status))}</strong> · ${escapeHtml(formatTime(history.started_ms))}${history.finished_ms ? ` → ${escapeHtml(formatTime(history.finished_ms))}` : ''}${history.error ? `<br><span class="muted">${escapeHtml(history.error)}</span>` : ''}</li>`).join('');
+        const runDetails = recentRuns ? `<details><summary>${escapeHtml(statusText(run?.status || 'none'))} · ${escapeHtml(formatTime(run?.started_ms))}</summary><ol>${recentRuns}</ol></details>` : escapeHtml(statusText(run?.status || 'none'));
+        const retry = event && ['failed', 'dead'].includes(event.status) ? `<button data-action="retry" data-id="${item.id}" data-event-id="${event.event_id}" type="button" class="secondary">${t('retryEvent')}</button>` : '';
         const cancellable = run?.status === 'running' || ['queued', 'failed', 'running'].some(status => (item.queue.counts?.[status] || 0) > 0);
-        const cancel = cancellable ? `<button data-action="cancel" data-id="${item.id}" type="button" class="secondary">取消执行</button>` : '';
-        return `<tr><td><strong>#${item.id}</strong><br>${state}</td><td><strong>${escapeHtml(config.workspace)}</strong></td><td>${escapeHtml(config.source)}</td><td><span class="pill">${escapeHtml(config.mode)}</span><br><span class="muted">${escapeHtml(config.crontab || '无调度')}</span></td><td>${runDetails}</td><td>${config.target.length}</td><td>${queue}<br><span class="muted">最老 ${Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1)}s</span><br>${event ? `<span class="muted">${escapeHtml(event.provider)} / ${escapeHtml(event.status)}</span>` : ''}</td><td>${escapeHtml(updated)}</td><td class="actions"><button data-action="run" data-id="${item.id}" type="button">立即同步</button>${cancel}${retry}<button data-action="edit" data-id="${item.id}" type="button">编辑</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? '停用' : '启用'}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">删除</button></td></tr>`;
-      }).join('') : `<tr><td colspan="9" class="muted">${snapshot.length ? '没有匹配的任务' : '没有任务，点击“新建任务”开始'}</td></tr>`;
+        const cancel = cancellable ? `<button data-action="cancel" data-id="${item.id}" type="button" class="secondary">${t('cancelExecution')}</button>` : '';
+        return `<tr><td class="task-id"><strong>#${item.id}</strong>${state}</td><td><strong class="workspace-path">${escapeHtml(config.workspace)}</strong></td><td><code class="repo-url">${escapeHtml(config.source)}</code></td><td><span class="pill">${escapeHtml(config.mode)}</span><span class="cell-detail">${escapeHtml(config.crontab || t('noSchedule'))}</span></td><td>${runDetails}</td><td><strong>${config.target.length}</strong><span class="cell-detail">${t('targets')}</span></td><td><span class="queue-count">${queue}</span><span class="cell-detail">${t('oldest', { seconds: Number(item.queue.oldest_pending_age_seconds || 0).toFixed(1) })}</span>${event ? `<span class="cell-detail">${escapeHtml(event.provider)} / ${escapeHtml(statusText(event.status))}</span>` : ''}</td><td>${escapeHtml(updated)}</td><td class="actions"><div class="action-list"><button data-action="run" data-id="${item.id}" type="button">${t('runNow')}</button>${cancel}${retry}<button data-action="edit" data-id="${item.id}" type="button">${t('edit')}</button><button data-action="toggle" data-id="${item.id}" type="button" class="secondary">${item.enabled ? t('disable') : t('enable')}</button><button data-action="delete" data-id="${item.id}" type="button" class="danger">${t('delete')}</button></div></td></tr>`;
+      }).join('') : `<tr><td colspan="9" class="muted">${snapshot.length ? t('noMatches') : t('noTasks')}</td></tr>`;
     }
 
     function setForm(task) {
@@ -438,7 +555,7 @@
       document.querySelector('#failure-cooldown-secs').value = item.failure_cooldown_secs; setLines('webhook-secret-envs', item.webhook_secret_envs);
       document.querySelector('#webhook-max-pending-events').value = item.webhook_max_pending_events;
       document.querySelector('#webhook-event-lease-secs').value = item.webhook_event_lease_secs;
-      editorTitle.textContent = task ? `编辑任务 #${task.id}` : '新建同步任务';
+      editorTitle.textContent = task ? `${t('editTask')} #${task.id}` : t('newSyncTask');
     }
 
     function formTask() {
@@ -458,8 +575,8 @@
       const id = document.querySelector('#task-id').value;
       try {
         await request(id ? `/api/tasks/${id}` : '/api/tasks', { method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(formTask()) });
-        message.textContent = '任务已保存并立即生效'; message.className = 'muted'; setForm(); await load();
-      } catch (error) { message.textContent = `保存失败：${error.message}`; message.className = 'error'; }
+        setMessage('saved'); setForm(); await load();
+      } catch (error) { setMessage('saveFailed', { error: error.message }, 'error'); }
     });
 
     passwordForm.addEventListener('submit', async event => {
@@ -467,13 +584,13 @@
       const currentPassword = document.querySelector('#current-password').value;
       const newPassword = document.querySelector('#new-password').value;
       if (newPassword !== document.querySelector('#new-password-confirm').value) {
-        message.textContent = '两次新密码不一致'; message.className = 'error'; return;
+        setMessage('passwordMismatch', {}, 'error'); return;
       }
       try {
         passwordSubmit.disabled = true;
         await request('/api/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) });
-        passwordForm.reset(); message.textContent = '密码已修改'; message.className = 'muted';
-      } catch (error) { message.textContent = `密码修改失败：${error.message}`; message.className = 'error'; }
+        passwordForm.reset(); setMessage('passwordChanged');
+      } catch (error) { setMessage('passwordChangeFailed', { error: error.message }, 'error'); }
       finally { passwordSubmit.disabled = false; }
     });
 
@@ -482,14 +599,14 @@
       const setup = !passwordConfirmField.hidden;
       const password = document.querySelector('#password').value;
       if (setup && password !== document.querySelector('#password-confirm').value) {
-        message.textContent = '两次密码不一致'; message.className = 'error'; return;
+        setMessage('passwordMismatchSetup', {}, 'error'); return;
       }
       authSubmit.disabled = true;
       try {
         await request(setup ? '/api/auth/setup' : '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector('#username').value, password }) });
         document.querySelector('#password').value = ''; document.querySelector('#password-confirm').value = '';
-        message.textContent = '登录成功'; message.className = 'muted'; await load();
-      } catch (error) { message.textContent = `${setup ? '设置失败' : '登录失败'}：${error.message}`; message.className = 'error'; }
+        setMessage('loginSuccess'); await load();
+      } catch (error) { setMessage(setup ? 'setupFailed' : 'loginFailed', { error: error.message }, 'error'); }
       finally { authSubmit.disabled = false; }
     });
 
@@ -499,39 +616,52 @@
       try {
         if (button.dataset.action === 'run') {
           await request(`/api/tasks/${id}/run`, { method: 'POST' });
-          message.textContent = `任务 #${id} 已加入执行队列`; message.className = 'muted'; await load(); return;
+          setMessage('queuedTask', { id }); await load(); return;
         }
         if (button.dataset.action === 'cancel') {
           await request(`/api/tasks/${id}/cancel`, { method: 'POST' });
-          message.textContent = `任务 #${id} 已请求取消`; message.className = 'muted'; await load(); return;
+          setMessage('cancelRequested', { id }); await load(); return;
         }
         if (button.dataset.action === 'retry') {
           await request(`/api/tasks/${id}/events/${button.dataset.eventId}/retry`, { method: 'POST' });
-          message.textContent = `事件 #${button.dataset.eventId} 已重新加入队列`; message.className = 'muted'; await load(); return;
+          setMessage('eventRetried', { eventId: button.dataset.eventId }); await load(); return;
         }
         if (button.dataset.action === 'edit') { setForm(task); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); return; }
         if (button.dataset.action === 'delete') {
-          if (!window.confirm(`删除任务 #${id}？不会删除 workspace 或运行历史。`)) return;
+          if (!window.confirm(t('deleteConfirm', { id }))) return;
           await request(`/api/tasks/${id}`, { method: 'DELETE' });
         } else {
           await request(`/api/tasks/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...task, enabled: !task.enabled }) });
         }
         setForm(); await load();
-      } catch (error) { message.textContent = `操作失败：${error.message}`; message.className = 'error'; }
+      } catch (error) { setMessage('actionFailed', { error: error.message }, 'error'); }
     });
 
     document.querySelector('#new-task').addEventListener('click', () => { setForm(); document.querySelector('#editor-title').scrollIntoView({ behavior: 'smooth' }); });
     document.querySelector('#cancel').addEventListener('click', () => setForm());
     taskFilter.addEventListener('input', render);
     statusFilter.addEventListener('change', render);
+    languageSelect.addEventListener('change', () => {
+      locale = languageSelect.value === 'en' ? 'en' : 'zh';
+      writeSetting('repo-sync-language', locale);
+      applyLocale();
+      render();
+    });
+    themeToggle.addEventListener('click', () => {
+      theme = theme === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = theme;
+      writeSetting('repo-sync-theme', theme);
+      updateThemeControl();
+    });
     logout.addEventListener('click', async () => {
       try {
         await request('/api/auth/logout', { method: 'POST' });
-        showAuth(true); message.textContent = '已退出登录'; message.className = 'muted';
+        showAuth(true); setMessage('logoutSuccess');
       } catch (error) {
-        message.textContent = `退出登录失败：${error.message}`; message.className = 'error';
+        setMessage('logoutFailed', { error: error.message }, 'error');
       }
     });
+    applyLocale();
     setForm(); initAuth(); setInterval(() => { if (document.visibilityState === 'visible' && !app.hidden) load(); }, 5000);
   </script>
 </body>
